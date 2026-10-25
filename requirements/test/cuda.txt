@@ -192,7 +192,7 @@ fastsafetensors==0.3.3
     # via
     #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
-filelock==3.32.4
+filelock==4.1.0
     # via
     #   -c requirements/common.txt
     #   blobfile
