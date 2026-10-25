@@ -2027,11 +2027,14 @@ class VllmConfig:
                 from .multimodal import ImageDummyOptions, VideoDummyOptions
 
                 limit_per_prompt = self.model_config.multimodal_config.limit_per_prompt
+                # DS4.1: the host-streamed tower skips encoder profiling, so the 1-image profiling cap does not
+                # apply; agent sessions keep every screenshot in the history
+                n_images = 64 if "DeepseekV41ForCausalLM" in (self.model_config.architectures or []) else 1
                 if not limit_per_prompt:
                     limit_per_prompt.update(
                         {
                             "image": ImageDummyOptions(
-                                count=1, width=None, height=None
+                                count=n_images, width=None, height=None
                             ),
                             "video": VideoDummyOptions(
                                 count=0,
@@ -2042,8 +2045,8 @@ class VllmConfig:
                         }
                     )
                     logger.info_once(
-                        "Using SM70 Flash-V100 multimodal default: image=1, "
-                        "video=0. Set --limit-mm-per-prompt to override."
+                        "Using SM70 Flash-V100 multimodal default: image=%d, "
+                        "video=0. Set --limit-mm-per-prompt to override.", n_images
                     )
                 elif "video" not in limit_per_prompt:
                     limit_per_prompt["video"] = VideoDummyOptions(
