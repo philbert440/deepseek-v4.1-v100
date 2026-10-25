@@ -68,7 +68,13 @@ class BlockHashToBlockMap:
             if isinstance(blocks, KVCacheBlock):
                 return blocks
             if isinstance(blocks, dict):
-                return next(iter(blocks.values()))
+                # Prefer a copy with an exact decoder-replay window (a hit
+                # shrunk below a non-deep copy recomputes a deep duplicate).
+                # Every copy is deep when the replay trim is off.
+                return next(
+                    (blk for blk in blocks.values() if blk.replay_deep),
+                    next(iter(blocks.values())),
+                )
             self._unexpected_blocks_type(blocks)
         return None
 
@@ -180,6 +186,17 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # Block ids the worker may unmap. Drained once per scheduler step.
+        self._demand_release_ids: list[int] = []
+
+    def _note_demand_release(self, block_id: int) -> None:
+        if block_id != 0:
+            self._demand_release_ids.append(block_id)
+
+    def take_demand_release_ids(self) -> list[int]:
+        ids = self._demand_release_ids
+        self._demand_release_ids = []
+        return ids
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -261,6 +278,10 @@ class BlockPool:
             )
 
         new_block_hashes = block_hashes[num_cached_blocks:]
+        # DeepSeek-V4.1 decoder replay: rows below this position were computed
+        # inexactly in the trimmed layers (0 when the trim is off; request-like
+        # stand-ins without the attribute are treated as off).
+        replay_exact_from = getattr(request, "replay_exact_from", 0)
         event_block_indices: list[int] | None = (
             [] if self.enable_kv_cache_events else None
         )
@@ -278,6 +299,7 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             blk.block_hash = block_hash_with_group_id
+            blk.replay_deep = (num_cached_blocks + i) * block_size >= replay_exact_from
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if event_block_indices is not None:
                 event_block_indices.append(num_cached_blocks + i)
@@ -387,6 +409,11 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        # The hash is gone and nobody holds the block, so its pages are dead.
+        # A block that is still referenced stays mapped; free_blocks releases
+        # it later, once ref_cnt hits 0.
+        if block.ref_cnt == 0 and not block.is_null:
+            self._note_demand_release(block.block_id)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -438,6 +465,11 @@ class BlockPool:
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
+        for block in freed_blocks:
+            # A remaining hash is a prefix-cache hit. Leave that page mapped
+            # until _maybe_evict_cached_block actually drops the hash.
+            if block.block_hash is None:
+                self._note_demand_release(block.block_id)
         if self.enable_caching:
             # Uncached scratch has no reusable prefix to evict, and blocks a
             # sliding window has moved past (``reuse_first``) can never serve a
@@ -501,8 +533,15 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Remove all hashes from all blocks.
+        # Remove all hashes from all blocks. Hashed free blocks were still
+        # mapped for prefix hits; they are reclaimable now.
         for block in self.blocks:
+            if (
+                block.block_hash is not None
+                and block.ref_cnt == 0
+                and not block.is_null
+            ):
+                self._note_demand_release(block.block_id)
             block.reset_hash()
 
         if self.metrics_collector:

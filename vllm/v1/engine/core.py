@@ -21,6 +21,35 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
+
+
+def ds41_no_empty_step() -> bool:
+    """VLLM_DS41_PP_NO_EMPTY_STEP=1 (default 0): see EngineCore.step_with_batch_queue."""
+    return os.environ.get("VLLM_DS41_PP_NO_EMPTY_STEP", "0") == "1"
+
+
+def ds41_fold_drafts() -> bool:
+    """VLLM_DS41_FOLD_DRAFTS=1 (default 0, sync scheduling + spec decode): the worker attaches the step's drafts to
+    its ModelRunnerOutput (gpu_worker.sample_tokens) and the engine applies them after update_from_output, instead
+    of a separate take_draft_token_ids RPC in post_step. Engine and workers read the same environment."""
+    return os.environ.get("VLLM_DS41_FOLD_DRAFTS", "0") == "1"
+
+
+def ds41_skippable_empty(out) -> bool:
+    """An empty batch whose only effect on the workers would be the round trip itself."""
+    if out is None or out.total_num_scheduled_tokens:
+        return False
+    if out.scheduled_new_reqs or out.scheduled_cached_reqs.req_ids or out.scheduled_encoder_inputs:
+        return False
+    if out.finished_req_ids or out.preempted_req_ids or out.free_encoder_mm_hashes:
+        return False
+    if getattr(out, "new_block_ids_to_zero", None) or getattr(out, "demand_release_block_ids", None):
+        return False
+    if getattr(out, "ds41_slices", ()) or getattr(out, "ds41_slice_aborts", ()):
+        return False
+    if out.kv_connector_metadata is not None or out.ec_connector_metadata is not None:
+        return False
+    return True
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
@@ -67,6 +96,9 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1 import ds41_slices
+from vllm.v1.engine import ds41_decode_lane
+from vllm.v1.engine import ds41_pp_pipeline
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -223,6 +255,70 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+
+        # DeepSeek-V4.1 pipelined chunked prefill (VLLM_DS41_PP_PREFILL_PIPELINE,
+        # default off): see vllm/v1/engine/ds41_pp_pipeline.py.
+        self._ds41_pp_prefill_pipeline = (
+            self.batch_queue is not None
+            and not self.async_scheduling
+            and ds41_pp_pipeline.pp_prefill_pipeline_enabled()
+        )
+        # Set per scheduled step: the step holds only partial prefill chunks, so
+        # post_step need not block on its (empty) drafts.
+        self._ds41_skip_draft_take = False
+        if self._ds41_pp_prefill_pipeline:
+            logger.info(
+                "DS41 pipelined chunked prefill on (%s=1): up to %d batches in "
+                "flight; post_step skips the blocking draft take after "
+                "partial-prefill-only steps",
+                ds41_pp_pipeline.PP_PREFILL_PIPELINE_KNOB,
+                self.batch_queue_size,
+            )
+        # DeepSeek-V4.1 decode lane (VLLM_DS41_DECODE_LANE, default off): see
+        # vllm/v1/engine/ds41_decode_lane.py. Needs VLLM_DS41_FOLD_DRAFTS=1.
+        self._ds41_decode_lane = False
+        self._ds41_lane_holds = 0
+        # DeepSeek-V4.1 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL, default off): the scheduler stages long
+        # prompts' chunks as per-step layer slices (vllm/v1/core/sched/ds41_sliced_prefill.py); the engine runs
+        # the decode lane hold ("submit one, block") so every submitted step carries the decode rows the slices
+        # ride on. Needs VLLM_DS41_FOLD_DRAFTS=1 and PP2.
+        self._ds41_sliced_prefill = False
+        if ds41_slices.sliced_prefill_enabled():
+            ds41_decode_lane.check_config(
+                fold_drafts=ds41_fold_drafts(),
+                async_scheduling=self.async_scheduling,
+                knob=ds41_slices.SLICED_PREFILL_KNOB,
+            )
+            if self.batch_queue is None or vllm_config.parallel_config.pipeline_parallel_size != 2:
+                logger.warning(
+                    "%s=1 has no effect without PP2 and the batch queue",
+                    ds41_slices.SLICED_PREFILL_KNOB,
+                )
+            else:
+                self._ds41_sliced_prefill = True
+                self._ds41_decode_lane = True
+                logger.info(
+                    "DS41 layer-sliced prefill on (%s=1): long prompts' non-final chunks run "
+                    "as layer slices beside the decode batch while a request decodes "
+                    "(decode lane hold on)",
+                    ds41_slices.SLICED_PREFILL_KNOB,
+                )
+        if ds41_decode_lane.decode_lane_enabled() and not self._ds41_sliced_prefill:
+            ds41_decode_lane.check_config(
+                fold_drafts=ds41_fold_drafts(), async_scheduling=self.async_scheduling
+            )
+            if self.batch_queue is None:
+                logger.warning(
+                    "%s=1 has no effect without a batch queue (pipeline parallel)",
+                    ds41_decode_lane.DECODE_LANE_KNOB,
+                )
+            else:
+                self._ds41_decode_lane = True
+                logger.info(
+                    "DS41 decode lane on (%s=1): no prefill-only batch enters the "
+                    "batch queue while every decoding request is in flight",
+                    ds41_decode_lane.DECODE_LANE_KNOB,
+                )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -508,6 +604,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._ds41_attach_folded_drafts(model_output)
         if profile_ddtree_engine:
             profile_update_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             logger.info(
@@ -532,7 +629,16 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        if (
+            self._ds41_pp_prefill_pipeline
+            and self._ds41_skip_draft_take
+            and model_executed
+        ):
+            # Partial prefill chunks propose no drafts; not blocking here lets the
+            # next chunk enter stage 0 while this one runs on the later stages.
+            return
+        if (not self.async_scheduling and self.use_spec_decode and model_executed
+                and not ds41_fold_drafts()):
             profile_ddtree_engine = (
                 os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
             )
@@ -607,9 +713,34 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # DS41 (VLLM_DS41_PP_NO_EMPTY_STEP=1): when every running request already has a batch in flight the
+        # scheduler returns an empty batch; submitting it costs a full RPC round trip through every worker (and
+        # makes each worker drop the in-flight request from its persistent batch, re-adding it next step). Block on
+        # the oldest in-flight batch instead.
+        ds41_scheduled = None
+        ds41_skip_schedule = False
+        # DS41 decode lane (VLLM_DS41_DECODE_LANE=1): while every decoding request has a batch in flight, the next
+        # batch could only be a prefill chunk that the decoder's next step would queue behind (FIFO workers); block
+        # on the oldest batch instead so every submitted step carries the decode rows. Decided before schedule().
+        if (
+            batch_queue
+            and getattr(self, "_ds41_decode_lane", False)   # tests build EngineCore via __new__
+            and ds41_decode_lane.should_hold(batch_queue, self.scheduler.running)
+        ):
+            ds41_skip_schedule = True
+            self._ds41_lane_holds += 1
+        elif batch_queue and ds41_no_empty_step() and self.scheduler.has_requests():
+            ds41_scheduled, ds41_skip_schedule = self._ds41_schedule_or_skip_empty()
+        if self.scheduler.has_requests() and not ds41_skip_schedule:
             trace_schedule_t0 = time.perf_counter() if trace_log else 0.0
-            scheduler_output = self.scheduler.schedule()
+            scheduler_output = (
+                ds41_scheduled if ds41_scheduled is not None else self.scheduler.schedule()
+            )
+            if self._ds41_pp_prefill_pipeline:
+                # Evaluated now: Request.is_prefill_chunk changes on the next schedule().
+                self._ds41_skip_draft_take = ds41_pp_pipeline.is_partial_prefill_only(
+                    scheduler_output, self.scheduler.requests
+                )
             if trace_log:
                 trace_schedule_ms = (time.perf_counter() - trace_schedule_t0) * 1000.0
                 trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -707,6 +838,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._ds41_attach_folded_drafts(model_output)
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
 
@@ -755,6 +887,32 @@ class EngineCore:
             )
 
         return engine_core_outputs, model_executed
+
+    def _ds41_schedule_or_skip_empty(self) -> tuple[SchedulerOutput | None, bool]:
+        """(output, skip): schedule; when the result is an empty batch that carries nothing a worker must see,
+        undo the scheduler's per-step bookkeeping (the last batch the workers saw is still the previous real one)
+        and report skip=True so the caller blocks on the oldest in-flight batch instead of submitting it."""
+        sched = self.scheduler
+        prev_ids = getattr(sched, "prev_step_scheduled_req_ids", None)
+        prev_ids = set(prev_ids) if prev_ids is not None else None
+        prev_step = getattr(sched, "current_step", None)
+        out = sched.schedule()
+        if not ds41_skippable_empty(out):
+            return out, False
+        if prev_ids is not None:
+            sched.prev_step_scheduled_req_ids.clear()
+            sched.prev_step_scheduled_req_ids.update(prev_ids)
+        if prev_step is not None:
+            sched.current_step = prev_step
+        self._ds41_empty_steps_skipped = getattr(self, "_ds41_empty_steps_skipped", 0) + 1
+        return None, True
+
+    def _ds41_attach_folded_drafts(self, model_output: ModelRunnerOutput | None) -> None:
+        """VLLM_DS41_FOLD_DRAFTS=1: the worker returned this step's drafts with its output (no separate
+        take_draft_token_ids RPC in post_step); attach them now that the step's tokens are processed."""
+        drafts = getattr(model_output, "ds41_draft_token_ids", None)
+        if drafts is not None and ds41_fold_drafts():
+            self.scheduler.update_draft_token_ids(drafts)
 
     def _fill_structured_output_drafts(
         self, scheduler_output: SchedulerOutput

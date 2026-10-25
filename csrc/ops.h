@@ -439,6 +439,66 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
 void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
                               torch::Tensor weight);
 
+void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
+                      torch::Tensor x, torch::Tensor topk_ids,
+                      torch::Tensor suh, std::optional<torch::Tensor> suh2);
+
+void exl3_moe_gemv_out(torch::Tensor y, std::optional<torch::Tensor> y2,
+                       torch::Tensor x, std::optional<torch::Tensor> x2,
+                       torch::Tensor trellis,
+                       std::optional<torch::Tensor> trellis2,
+                       torch::Tensor expert_ids,
+                       std::optional<torch::Tensor> group_rows, bool colmajor,
+                       int64_t codebook);
+
+void exl3_moe_gemv_mixed_out(torch::Tensor y, std::optional<torch::Tensor> y2,
+                             torch::Tensor x, std::optional<torch::Tensor> x2,
+                             torch::Tensor trellis,
+                             std::optional<torch::Tensor> trellis2,
+                             torch::Tensor offsets, torch::Tensor kbits,
+                             torch::Tensor expert_ids,
+                             std::optional<torch::Tensor> group_rows,
+                             bool colmajor, int64_t codebook, int64_t n,
+                             int64_t ksplit);
+
+void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
+                      torch::Tensor topk_ids, torch::Tensor g_svh,
+                      torch::Tensor u_svh, torch::Tensor d_suh,
+                      double limit, int64_t ksplit);
+
+void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
+                       torch::Tensor topk_ids, torch::Tensor topk_weights,
+                       torch::Tensor d_svh, int64_t ksplit);
+
+void exl3_moe_plan_out(torch::Tensor row_slot, torch::Tensor slot_row,
+                       torch::Tensor row_exp, torch::Tensor tiles,
+                       torch::Tensor info, torch::Tensor loc,
+                       int64_t num_experts, int64_t t16, int64_t t32,
+                       int64_t dense_min);
+
+void exl3_moe_pre_rows_out(torch::Tensor out, std::optional<torch::Tensor> out2,
+                           torch::Tensor x, torch::Tensor row_slot,
+                           torch::Tensor row_exp, torch::Tensor suh,
+                           std::optional<torch::Tensor> suh2, int64_t topk);
+
+void exl3_moe_gemm_tiled_out(torch::Tensor y, std::optional<torch::Tensor> y2,
+                             torch::Tensor x, std::optional<torch::Tensor> x2,
+                             torch::Tensor trellis,
+                             std::optional<torch::Tensor> trellis2,
+                             torch::Tensor offsets, torch::Tensor kbits,
+                             torch::Tensor tiles, int64_t row_tile,
+                             int64_t codebook, int64_t n, int64_t ksplit,
+                             int64_t layout);
+
+void exl3_moe_post_rows_out(torch::Tensor out, torch::Tensor yd,
+                            torch::Tensor slot_row, torch::Tensor row_exp,
+                            torch::Tensor d_svh, int64_t ksplit);
+
+void exl3_moe_reconstruct_out(torch::Tensor w, torch::Tensor trellis,
+                              int64_t offset, int64_t K, int64_t codebook);
+
+void exl3_moe_dense_out(torch::Tensor y, torch::Tensor x, torch::Tensor w);
+
 void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
                                    torch::Tensor permuted_input,
                                    torch::Tensor sorted_row_idx,

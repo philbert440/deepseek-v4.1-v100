@@ -5,6 +5,7 @@ import functools
 import gc
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -208,7 +209,7 @@ from vllm.v1.spec_decode.draft_prob_alignment import (
     get_aligned_draft_probs,
     get_aligned_draft_scalar_values,
 )
-from vllm.v1.spec_decode.dspark import DSparkProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer, ds41_dspark_adaptive_enabled
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -333,6 +334,28 @@ def _dflash_ddtree_trace_event(
             trace_file.write("\n")
     except OSError:
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
+
+
+def pp_stage_token_window(
+    start: int, num_computed: int, num_main: int, new_token_ids: list[int]
+) -> tuple[int, list[int]]:
+    """Non-last PP stage, a request that stayed in the persistent batch: (end, tokens) to write at
+    token_ids_cpu[start:end]. The stage needs every token up to num_computed + this step's main (non-spec) tokens.
+    Synchronous PP + spec decode sends every token the stage lacks (accepted drafts + bonus, 7ac1eec1f1), so
+    ``len(new_token_ids)`` exceeds the main-token count after an accepted draft; ``num_computed + len(new_token_ids)``
+    then overshot by the accepted count (a request that kept its persistent-batch row across two decode steps,
+    i.e. with VLLM_DS41_PP_NO_EMPTY_STEP=1). Without spec decode (and for prefill chunks) the two counts agree."""
+    if not new_token_ids:
+        return max(start, num_computed), []
+    k = num_main if 0 < num_main <= len(new_token_ids) else len(new_token_ids)
+    end = max(start, num_computed + k)
+    n = end - start
+    if n > len(new_token_ids):
+        raise RuntimeError(
+            f"PP stage token window: {n} tokens needed at [{start}, {end}) but the scheduler sent "
+            f"{len(new_token_ids)}"
+        )
+    return end, (new_token_ids[-n:] if n > 0 else [])
 
 
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
@@ -1118,6 +1141,23 @@ def _non_greedy_rows_carry_drafts(
     return any(n > 0 and not greedy for n, greedy in zip(num_draft_tokens, is_greedy))
 
 
+def _ds41_segments_by_pool() -> dict[tuple, tuple[int, int]]:
+    """{private pool id: (reserved bytes, active bytes)} of this device's caching-allocator segments; (0, 0) is the
+    regular allocator. Startup-only (DS41 attention precapture accounting): a snapshot walks every segment."""
+    out: dict[tuple, tuple[int, int]] = {}
+    try:
+        dev = torch.cuda.current_device()
+        for seg in torch.cuda.memory_snapshot():
+            if seg.get("device", dev) != dev:
+                continue
+            pool = tuple(seg.get("segment_pool_id", (0, 0)))
+            tot, act = out.get(pool, (0, 0))
+            out[pool] = (tot + int(seg.get("total_size", 0)), act + int(seg.get("active_size", 0)))
+    except Exception:  # accounting only
+        logger.debug("DS41 precapture: allocator snapshot failed", exc_info=True)
+    return out
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1448,6 +1488,8 @@ class GPUModelRunner(
                     and self.speculative_config.dspark_max_verification_tokens
                     < self.num_spec_tokens
                 )
+                # DS41 adaptive draft length (VLLM_DS41_DSPARK_PMIN / _MAX_ROWS): same per-request length path
+                or ds41_dspark_adaptive_enabled()
             )
         )
         if self.dspark_confidence_scheduling and self.use_async_scheduling:
@@ -2349,6 +2391,14 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        # Map the pages the zeroer is about to touch, and unmap blocks the
+        # scheduler has actually reclaimed. New request rows are appended
+        # below; a second commit picks up mamba ids that are not in the
+        # attention zero list.
+        self._ds41_demand_kv_commit(
+            scheduler_output.new_block_ids_to_zero,
+            getattr(scheduler_output, "demand_release_block_ids", None),
+        )
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
@@ -2555,9 +2605,18 @@ class GPUModelRunner(
                     new_token_ids = req_data.new_token_ids[i]
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                    # The scheduler sends every token this stage lacks (accepted drafts
+                    # + bonus): the count of NEW output tokens is the gap between the
+                    # computed position plus this step's main tokens and the state.
+                    num_main = scheduler_output.num_scheduled_tokens.get(req_id, 0) - len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
                     )
+                    num_new_tokens = num_computed_tokens + num_main - req_state.num_tokens
+                    if num_new_tokens > len(new_token_ids):
+                        raise RuntimeError(
+                            f"PP: request {req_id} needs {num_new_tokens} new token ids but the "
+                            f"scheduler sent {len(new_token_ids)}"
+                        )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
                         req_state.output_token_ids.append(new_token_ids[-1])
@@ -2623,15 +2682,16 @@ class GPUModelRunner(
                 # than num_tokens_no_spec.
                 # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
                 # according to num_computed_tokens.
-                end_token_index = max(
+                end_token_index, tokens_to_append = pp_stage_token_window(
                     start_token_index,
-                    num_computed_tokens + len(new_token_ids),
+                    num_computed_tokens,
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                    - len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())),
+                    new_token_ids,
                 )
                 if end_token_index > start_token_index:
                     if new_token_ids:
                         # Add new_token_ids to token_ids_cpu.
-                        num_new_tokens = end_token_index - start_token_index
-                        tokens_to_append = new_token_ids[-num_new_tokens:]
                         self.input_batch.token_ids_cpu[
                             req_index, start_token_index:end_token_index
                         ] = tokens_to_append
@@ -2672,6 +2732,10 @@ class GPUModelRunner(
                 _pinned_idx_buf=self._ngram_pinned_idx_buf,
                 _pinned_val_buf=self._ngram_pinned_val_buf,
             )
+
+        # Block ids for this step are complete, including groups the zero
+        # list does not name. Releases were already applied above.
+        self._ds41_demand_kv_commit(None, None)
 
         if deferred_spec_decode_corrections:
 
@@ -5255,6 +5319,13 @@ class GPUModelRunner(
                 # [cumulative_end - (draft_len + 1), cumulative_end). Fewer
                 # query rows than that would silently select the preceding
                 # request's hidden states.
+                if num_scheduled_tokens[req_idx] < draft_len + 1:
+                    logger.error("spec decode: req %s idx %d scheduled %d < draft_len %d + 1 (computed %d, prompt %d, "
+                                 "num_reqs %d, scheduled_spec keys %d, pp_rank %d)", req_id, req_idx,
+                                 int(num_scheduled_tokens[req_idx]), draft_len,
+                                 int(self.input_batch.num_computed_tokens_cpu[req_idx]),
+                                 int(self.input_batch.num_prompt_tokens[req_idx]), num_reqs,
+                                 len(scheduler_output.scheduled_spec_decode_tokens), get_pp_group().rank_in_group)
                 assert num_scheduled_tokens[req_idx] >= draft_len + 1
                 num_draft_tokens[req_idx] = draft_len
                 if (
@@ -6551,6 +6622,31 @@ class GPUModelRunner(
             )
         self._engram_bind_service_cache = service
         return service
+
+    def _ds41_replay_controller(self) -> Any | None:
+        """DeepSeek-V4.1 decoder-replay controller of this stage's model, or None; resolved once."""
+        cached = getattr(self, "_ds41_replay_cache", False)
+        if cached is not False:
+            return cached
+        model = self.get_model() if hasattr(self, "model") else None
+        controller = getattr(model, "ds41_replay", None)
+        if controller is not None and self.use_async_scheduling:
+            raise NotImplementedError(
+                "VLLM_DS41_REPLAY_ROWS needs synchronous scheduling (exact host token counts)"
+            )
+        self._ds41_replay_cache = controller
+        return controller
+
+    def _ds41_replay_target_lens(self, num_reqs: int) -> np.ndarray:
+        """N_req per request (prompt + generated tokens, no spec drafts). A request with
+        prompt logprobs reads the logits of every prompt row: N_req = 0 keeps them all."""
+        n_req = self.input_batch.num_tokens_no_spec[:num_reqs].astype(np.int64)
+        if self.num_prompt_logprobs:
+            for req_id in self.num_prompt_logprobs:
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                if idx is not None and idx < num_reqs:
+                    n_req[idx] = 0
+        return n_req
 
     def _refuse_full_cudagraphs_with_engram(self) -> None:
         """PORT_DESIGN §9 AM-11c: a stage with Engram layers runs breakable graphs only.
@@ -8682,6 +8778,13 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if os.environ.get("DS41_DEBUG_INPUTS", "0") == "1" and num_tokens_unpadded <= 16:
+                torch.cuda.synchronize()
+                logger.info("DS41 inputs: T %d ids %s pos %s reqs %s computed %s", num_tokens_unpadded,
+                            self.input_ids.gpu[:num_tokens_unpadded].tolist(),
+                            self.positions.gpu[:num_tokens_unpadded].tolist() if hasattr(self.positions, "gpu") else "?",
+                            list(self.input_batch.req_ids[:num_reqs]),
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist())
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0
@@ -8742,6 +8845,16 @@ class GPUModelRunner(
                     self._engram_batch_layout(
                         num_reqs, num_tokens_unpadded, num_tokens_padded
                     )
+                )
+            ds41_replay = self._ds41_replay_controller()
+            if ds41_replay is not None:
+                # DeepSeek-V4.1 decoder replay (VLLM_DS41_REPLAY_ROWS): the per-request
+                # token counts this step works toward, in batch order; host data only.
+                ds41_replay.bind(
+                    num_reqs,
+                    num_tokens_unpadded,
+                    self.query_start_loc.np[: num_reqs + 1],
+                    self._ds41_replay_target_lens(num_reqs),
                 )
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
@@ -9571,6 +9684,17 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+
+        # VLLM_DS41_DSPARK_TRACE (debug, default off): one JSON line per request per drafted step on the last PP
+        # stage, TP rank 0 (vllm/v1/spec_decode/ds41_dspark_trace.py). Only steps whose drafter ran this call.
+        if spec_config is not None and self._draft_token_ids is not None:
+            ds41_trace = getattr(self, "_ds41_dspark_trace", False)
+            if ds41_trace is False:
+                from vllm.v1.spec_decode.ds41_dspark_trace import DSparkTrace
+                ds41_trace = self._ds41_dspark_trace = DSparkTrace.for_runner(self)
+            if ds41_trace is not None:
+                ds41_trace.on_step(self, scheduler_output, valid_sampled_token_ids,
+                                   spec_decode_common_attn_metadata)
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             trace_output_t0 = time.perf_counter() if trace_log else 0.0
@@ -10574,6 +10698,11 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+        # DeepSeek-V4.1 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL=1): per-stage slice
+        # state allocated here, before the memory profile, so the KV budget accounts for it.
+        from vllm.v1.worker import ds41_sliced_prefill as _ds41_sp
+
+        self._ds41_slicer = _ds41_sp.create_executor(self)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -10618,9 +10747,29 @@ class GPUModelRunner(
             self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
             drafter = getattr(self, "drafter", None)
             if drafter is not None and hasattr(drafter, "model"):
-                drafter.model = BreakableCUDAGraphWrapper(
-                    drafter.model, self.vllm_config
-                )
+                if os.environ.get("DS41_DRAFT_PLAIN_GRAPH", "1") == "1":
+                    # DeepInfer's drafter shape (worker/dflash_cuda_graph_runner.py): one plain CUDA graph per batch size
+                    # over static inputs, no eager breaks (the drafter has none). The breakable wrapper's 2-seq drafter
+                    # graph died at its first replay (2026-10-20, dspark-graph-b2h..b2-debug).
+                    drafter.model = CUDAGraphWrapper(
+                        drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
+                    )
+                    if os.environ.get("DS41_DRAFT_OWN_POOL", "1") == "1":
+                        # The drafter's graphs get a pool of their own (DeepInfer passes the drafter runner its own
+                        # graph_memory_pool).
+                        drafter.model.graph_pool = current_platform.graph_pool_handle()
+                    if os.environ.get("DS41_DRAFT_NCCL_AR", "1") == "1":
+                        # 2026-10-21: the 2-sequence drafter graph died at its first replay with an illegal memory access
+                        # until the CUSTOM all-reduce was disabled (--disable-custom-all-reduce made B=2/B=4 exact): the
+                        # custom AR's graph mode works on IPC-registered buffers looked up by pointer, and the drafter graph
+                        # at a second batch size all-reduces a buffer that was not registered at capture. Disabling it
+                        # globally costs 4-7 % single-stream (every main-model layer's all-reduce), so the custom AR is
+                        # switched off only while the drafter runs: its all-reduces fall back to NCCL (graph-capturable).
+                        drafter.model = _DrafterNcclAllReduce(drafter.model)
+                else:
+                    drafter.model = BreakableCUDAGraphWrapper(
+                        drafter.model, self.vllm_config
+                    )
         elif (
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
@@ -10693,9 +10842,14 @@ class GPUModelRunner(
         if not layer_ids:
             dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
             if dspark_layer_ids:
-                # DSpark config uses zero-based decoder-layer IDs; the target
-                # model's capture interface numbers outputs after each layer.
-                layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
+                if getattr(hf_config, "model_type", "") == "deepseek_v41":
+                    # DeepSeek-V4.1 feeds the drafter the attention INPUT of its target layers (the stream after
+                    # layer id - 1), which is exactly capture id "id" in the output-after-layer numbering.
+                    layer_ids = list(dspark_layer_ids)
+                else:
+                    # DSpark config uses zero-based decoder-layer IDs; the target
+                    # model's capture interface numbers outputs after each layer.
+                    layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
@@ -10995,6 +11149,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         batch_descriptor_override: BatchDescriptor | None = None,
+        ds41_batch: tuple[tuple[int, ...], int] | None = None,
     ) -> tuple[
         torch.Tensor | IntermediateTensors,
         torch.Tensor | None,
@@ -11002,6 +11157,10 @@ class GPUModelRunner(
         """
         Run a dummy forward pass to warm up/profile run or capture the
         CUDA graph for the model.
+
+        ``ds41_batch`` (DeepSeek-V4.1 attention precapture): (query rows per
+        request, context length of every request) -- an exact decode/verify
+        batch shape; the drafter is not run.
 
         Args:
             num_tokens: Number of tokens to run the dummy forward pass.
@@ -11079,7 +11238,14 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if ds41_batch is not None:
+            assert not uniform_decode and not create_mixed_batch
+            num_scheduled_tokens_list = [int(n) for n in ds41_batch[0]]
+            num_reqs = len(num_scheduled_tokens_list)
+            assert 1 <= num_reqs <= max_num_reqs, (num_reqs, max_num_reqs)
+            max_query_len = max(num_scheduled_tokens_list)
+            assert int(ds41_batch[1]) >= max_query_len, ds41_batch
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -11215,7 +11381,9 @@ class GPUModelRunner(
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                if profile_seq_lens is not None:
+                if ds41_batch is not None:
+                    seq_lens = int(ds41_batch[1])  # type: ignore[assignment]
+                elif profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
                     # In the mixed batch mode (used for FI warmup), we use
@@ -11417,6 +11585,9 @@ class GPUModelRunner(
                     type(attn_metadata).__name__ if attn_metadata is not None else None,
                     skip_compiled_profile,
                 )
+                # Dummy block tables index block 0. Do not unmap prefix-cached
+                # pages that are no longer on a request.
+                self._ds41_demand_kv_commit(None, None)
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -11444,6 +11615,7 @@ class GPUModelRunner(
 
             if (
                 self.speculative_config
+                and ds41_batch is None
                 and get_pp_group().is_last_rank
                 and (
                     self.speculative_config.use_eagle()
@@ -11933,6 +12105,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        self._ds41_cg_mem_profiling = True
+        try:
+            return self._profile_cudagraph_memory()
+        finally:
+            self._ds41_cg_mem_profiling = False
+
+    def _profile_cudagraph_memory(self) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -12119,6 +12298,10 @@ class GPUModelRunner(
         # after here.
         set_cudagraph_capturing_enabled(False)
 
+        # DeepSeek-V4.1 (VLLM_DS41_ATTN_PRECAPTURE): every per-layer decode/verify attention graph, now, through the
+        # outer graphs just captured (their eager breaks carry the pointers the per-layer keys bind).
+        self._ds41_precapture_attention_graphs()
+
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
@@ -12137,6 +12320,137 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
+    def _ds41_precapture_attention_graphs(self) -> int:
+        """VLLM_DS41_ATTN_PRECAPTURE: capture every DS41 per-layer attention graph (and the metadata-builder graphs)
+        for the decode/verify key shapes of ``precapture.plan_batches`` with real-metadata dummy steps, so no
+        graph is captured mid-serve. Each shape runs GRAPH_WARMUP_STEPS + 1 times (warm, then capture + replay).
+        Then VLLM_DS41_ATTN_NO_LAZY_CAPTURE freezes the key sets: a key not captured here runs eagerly. Returns the
+        driver memory the capture took (bytes). Every TP rank runs the same plan (deterministic in the config),
+        so the collectives inside the dummy steps stay matched; the PP stages run theirs independently."""
+        from vllm.models.deepseek_v41.sm70 import precapture as ds41_pc
+
+        if not (ds41_pc.precapture_enabled() or ds41_pc.no_lazy_capture()):
+            return 0
+        from vllm.models.deepseek_v41 import attention as ds41_attn
+        from vllm.models.deepseek_v41.sm70 import sparse as ds41_sparse
+
+        ctx = self.compilation_config.static_forward_context
+        n_layers = sum(1 for m in ctx.values() if isinstance(m, ds41_attn.DeepseekV41Attention))
+        if n_layers == 0:
+            return 0
+        freeze = ds41_pc.no_lazy_capture()
+        if not ds41_pc.precapture_enabled():
+            ds41_pc.finish(freeze=freeze)
+            logger.warning("DS41 attn: VLLM_DS41_ATTN_NO_LAZY_CAPTURE=1 without VLLM_DS41_ATTN_PRECAPTURE=1: no "
+                           "per-layer attention graph was captured, every decode step runs the attention eagerly")
+            return 0
+        active, why = ds41_attn.layer_graphs_active()
+        if not active:
+            ds41_pc.finish(freeze=freeze)
+            logger.info("DS41 attn precapture: skipped (%s: no per-layer attention graphs)", why)
+            return 0
+        if getattr(self, "requests", None):
+            raise RuntimeError("DS41 attn precapture must run before any request is scheduled "
+                               f"({len(self.requests)} live)")
+        batches = ds41_pc.plan_batches(
+            capture_sizes=list(self.compilation_config.cudagraph_capture_sizes or []),
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            query_len=self.uniform_decode_query_len,
+            graph_max_t=ds41_attn.GRAPH_MAX_T,
+            max_model_len=self.max_model_len,
+            max_num_tokens=self.max_num_tokens,
+            shapes=ds41_pc.precapture_shapes(),
+        )
+        cap = ds41_attn.ensure_graph_key_capacity(len(batches) + 32)
+        runs = ds41_attn.GRAPH_WARMUP_STEPS + 1
+        mapped0 = len(getattr(self, "_ds41_mapped_blocks", ()) or ())
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        free0 = torch.cuda.mem_get_info()[0]
+        reserved0 = torch.cuda.memory_reserved()
+        attn0 = ds41_attn.graph_stats()
+        bld0 = dict(ds41_sparse.BUILDER_GRAPH_STATS)
+        keys0 = attn0["keys"]
+        seg0 = _ds41_segments_by_pool()
+        t0 = time.perf_counter()
+        ds41_pc.begin()
+        try:
+            for b in batches:
+                for _ in range(runs):
+                    self._dummy_run(
+                        b.num_tokens,
+                        force_attention=True,
+                        skip_eplb=True,
+                        remove_lora=False,
+                        ds41_batch=(b.query_lens, b.seq_len),
+                    )
+            torch.accelerator.synchronize()
+        finally:
+            ds41_pc.finish(freeze=freeze)
+        elapsed = time.perf_counter() - t0
+        torch.accelerator.empty_cache()
+        free1 = torch.cuda.mem_get_info()[0]
+        reserved1 = torch.cuda.memory_reserved()
+        keys = ds41_attn.graph_stats()["keys"] - keys0
+        mapped1 = len(getattr(self, "_ds41_mapped_blocks", ()) or ())
+        used = max(0, free0 - free1)
+        reserve = ds41_pc.precapture_reserve_bytes()
+        descs = ds41_pc.STATE.captured
+        mib = 1 << 20
+        logger.info(
+            "DS41 attn precapture: done. %d batch shapes x %d runs in %.1f s; %d per-layer decode-graph keys captured "
+            "over %d layers (%d key shapes: %s; regimes %s; key cap %d); allocator reserve %+.0f MiB, driver free "
+            "%+.0f MiB (KV-budget reserve %.0f MiB); demand-KV mapped ids %d -> %d; lazy capture after startup: %s",
+            len(batches), runs, elapsed, keys, n_layers, len(descs), ds41_pc.describe_pairs(descs),
+            ",".join(sorted({d[3] for d in descs})) or "-", cap, (reserved1 - reserved0) / mib,
+            (free1 - free0) / mib, reserve / mib, mapped0, mapped1,
+            "OFF (VLLM_DS41_ATTN_NO_LAZY_CAPTURE=1: unseen keys run eagerly)" if freeze else "allowed (logged)")
+        attn1 = ds41_attn.graph_stats()
+        bld1 = ds41_sparse.BUILDER_GRAPH_STATS
+        n_attn = attn1["graphs"] - attn0["graphs"]
+        n_bld = bld1["graphs"] - bld0["graphs"]
+        torch_grew = reserved1 - reserved0
+        other = used - max(0, torch_grew)
+        # where the memory went, from the allocator snapshot (segments by private pool, after empty_cache): the
+        # attention pool, the builder pool, the regular allocator (live tensors / segments pinned by them), and
+        # driver memory outside the caching allocator (instantiated CUDA graphs)
+        seg1 = _ds41_segments_by_pool()
+        names = {tuple(h): "attention" for h in ds41_attn._GRAPH_POOLS.values()}
+        names.update({tuple(h): "builders" for h in ds41_sparse._BUILDER_POOLS.values()})
+        delta: dict[str, list[int]] = {}
+        for pool in set(seg0) | set(seg1):
+            name = names.get(pool, "allocator" if pool == (0, 0) else "other pools")
+            b0, b1 = seg0.get(pool, (0, 0)), seg1.get(pool, (0, 0))
+            d = delta.setdefault(name, [0, 0])
+            d[0] += b1[0] - b0[0]
+            d[1] += b1[1] - b0[1]
+        logger.info(
+            "DS41 attn precapture memory: attention %d graphs (per-key q/qr32 held %.0f MiB, reserve growth seen "
+            "around the captures %+.0f MiB); builders %d graphs; segments by pool (reserved / active MiB): %s; "
+            "outside the allocator %.0f MiB (~%.0f KiB per graph)",
+            n_attn, (attn1["st_bytes"] - attn0["st_bytes"]) / mib, (attn1["grew"] - attn0["grew"]) / mib, n_bld,
+            ", ".join(f"{k} {v[0] / mib:+.0f}/{v[1] / mib:+.0f}" for k, v in sorted(delta.items())) or "-",
+            other / mib, other / 1024 / max(1, n_attn + n_bld))
+        if used > reserve:
+            logger.warning(
+                "DS41 attn precapture took %.0f MiB of driver memory, more than the %.0f MiB taken off the KV budget "
+                "(VLLM_DS41_ATTN_PRECAPTURE_RESERVE_MIB); raise it to >= %.0f",
+                used / mib, reserve / mib, math.ceil(used / mib))
+        if mapped1 != mapped0:
+            logger.warning("DS41 attn precapture changed the demand-KV mapped block set (%d -> %d ids)",
+                           mapped0, mapped1)
+        return used
+
+    def _ds41_outer_graph(self) -> bool:
+        """DeepSeek-V4.1 SM70 (VLLM_DS41_ATTN_OUTER_GRAPH): attention of non-indexer layers is captured inside the
+        breakable graph, so capture needs real-shaped attention metadata (the builders' static buffers). Not during
+        the CUDA-graph memory profiling (profile_cudagraph_memory): its 2-block placeholder caches are not the ones
+        the real capture must bind, and the attention refuses them."""
+        if getattr(self, "_ds41_cg_mem_profiling", False):
+            return False
+        return os.environ.get("VLLM_DS41_ATTN_GRAPH", "0") == "1" and os.environ.get(
+            "VLLM_DS41_ATTN_OUTER_GRAPH", "0") == "1"
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -12148,7 +12462,10 @@ class GPUModelRunner(
     ):
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
-        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL or self._ds41_outer_graph()
+        if self._ds41_outer_graph() or getattr(self, "_ds41_cg_mem_profiling", False):
+            logger.info("DS41 capture: desc=%s mode=%s force_attention=%s mem_profiling=%s", desc, cudagraph_runtime_mode,
+                        force_attention, getattr(self, "_ds41_cg_mem_profiling", False))
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -12189,6 +12506,7 @@ class GPUModelRunner(
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            force_attention=force_attention,     # the warmups had it; the capture itself must build metadata too
             uniform_decode=desc.uniform,
             allow_microbatching=allow_microbatching,
             skip_eplb=True,
@@ -12657,6 +12975,170 @@ class GPUModelRunner(
         )
         assert self._init_dcp_sharded == dcp_sharded
 
+    def _ds41_try_demand_slots(self, kv_cache_config) -> list[torch.Tensor] | None:
+        """Virtual KV tensors, or None to keep the eager full-pool allocation."""
+        flag = os.environ.get("VLLM_DS41_DEMAND_KV", "1")
+        if flag in ("0", "false", "False", "no", "NO"):
+            return None
+        if self.device.type != "cuda":
+            return None
+        num_blocks = kv_cache_config.num_blocks
+        if num_blocks <= 0:
+            return None
+        slots: list = []
+        tensors: list[torch.Tensor] = []
+        try:
+            from vllm.v1.worker.ds41_demand_kv import DemandKVSlot
+
+            device_index = torch.cuda.current_device()
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                size = kv_cache_tensor.size
+                if size % num_blocks != 0 or size // num_blocks <= 0:
+                    raise RuntimeError(
+                        f"KV tensor size {size} is not a multiple of "
+                        f"{num_blocks} blocks"
+                    )
+                slot = DemandKVSlot(
+                    size, size // num_blocks, num_blocks, device_index
+                )
+                slots.append(slot)
+                tensors.append(slot.tensor)
+        except Exception:
+            logger.exception(
+                "DS41 demand KV unavailable; allocating the full KV pool"
+            )
+            self._ds41_demand_slots = []
+            return None
+        self._ds41_demand_slots = slots
+        self._ds41_mapped_blocks = {0}
+        physical = sum(slot.mapped_bytes() for slot in slots)
+        logger.info(
+            "DS41 demand KV: %d tensors, %.2f GiB virtual, %.1f MiB physical "
+            "(granularity %d). VLLM_DS41_DEMAND_KV=0 allocates the full pool.",
+            len(slots),
+            sum(tensor.numel() for tensor in tensors) / (1024**3),
+            physical / (1024**2),
+            slots[0].granularity,
+        )
+        return tensors
+
+    def _ds41_block_groups(self, block_ids):
+        if block_ids is None:
+            return ()
+        if (
+            isinstance(block_ids, (list, tuple))
+            and block_ids
+            and isinstance(block_ids[0], (list, tuple))
+        ):
+            return block_ids
+        return (block_ids,)
+
+    def _ds41_fresh_block_ids(self, extra_block_ids) -> list[int]:
+        """Block ids this worker has not accounted for yet.
+
+        Steady decode only reads the suffix appended since the last call.
+        Prefix-cached ids stay mapped and are not walked again.
+        """
+        from vllm.v1.worker.ds41_demand_kv import flatten_block_ids
+
+        mapped = self._ds41_mapped_blocks
+        fresh: list[int] = []
+        seen: set[int] = set()
+
+        def consider(block_id) -> None:
+            try:
+                block_id = int(block_id)
+            except (TypeError, ValueError):
+                return
+            if block_id < 0 or block_id in seen or block_id in mapped:
+                return
+            seen.add(block_id)
+            fresh.append(block_id)
+
+        requests = getattr(self, "requests", None) or {}
+        cursor = getattr(self, "_ds41_block_cursor", None)
+        if cursor is None:
+            cursor = {}
+            self._ds41_block_cursor = cursor
+        live: set = set()
+        for req_id, req in requests.items():
+            live.add(req_id)
+            groups = self._ds41_block_groups(getattr(req, "block_ids", None))
+            prev = cursor.get(req_id)
+            intact = prev is not None and len(prev) == len(groups)
+            if intact:
+                for index, group in enumerate(groups):
+                    old_len, old_last = prev[index]
+                    if len(group) < old_len or (
+                        old_len > 0 and group[old_len - 1] != old_last
+                    ):
+                        intact = False
+                        break
+            if not intact:
+                found: set[int] = set()
+                flatten_block_ids(getattr(req, "block_ids", None), found)
+                for block_id in found:
+                    consider(block_id)
+            else:
+                for index, group in enumerate(groups):
+                    for block_id in group[prev[index][0] :]:
+                        consider(block_id)
+            cursor[req_id] = tuple(
+                (len(group), group[-1] if len(group) else None) for group in groups
+            )
+        for req_id in list(cursor):
+            if req_id not in live:
+                del cursor[req_id]
+        if extra_block_ids:
+            extra: set[int] = set()
+            flatten_block_ids(extra_block_ids, extra)
+            for block_id in extra:
+                consider(block_id)
+        return fresh
+
+    def _ds41_demand_kv_commit(self, extra_block_ids, release_block_ids) -> None:
+        """Map pages for ids added this step. Unmap only ids that were freed.
+
+        Called before ``_zero_block_ids`` and again after new block ids are
+        appended. ``release_block_ids`` is applied on the first call only.
+        An id present in both lists stays mapped: the zeroer still owns it.
+        Prefix-cached ids are not released and are not revisited.
+        """
+        slots = getattr(self, "_ds41_demand_slots", None)
+        if not slots:
+            return
+        from vllm.v1.worker.ds41_demand_kv import flatten_block_ids
+
+        capturing = torch.cuda.is_current_stream_capturing()
+        # Async scheduling can still be touching the previous step's pages.
+        unmap = not capturing and not getattr(self, "use_async_scheduling", False)
+        mapped = self._ds41_mapped_blocks
+        added = self._ds41_fresh_block_ids(extra_block_ids)
+        mapped.update(added)
+        removed: list[int] = []
+        if unmap and release_block_ids:
+            keep: set[int] = set()
+            flatten_block_ids(extra_block_ids, keep)
+            for block_id in release_block_ids:
+                try:
+                    block_id = int(block_id)
+                except (TypeError, ValueError):
+                    continue
+                if block_id <= 0 or block_id in keep or block_id not in mapped:
+                    continue
+                mapped.remove(block_id)
+                removed.append(block_id)
+        if added or removed:
+            for slot in slots:
+                slot.apply_delta(added, removed, unmap=unmap)
+        if len(mapped) > 1 and not getattr(self, "_ds41_demand_logged_live", False):
+            self._ds41_demand_logged_live = True
+            physical = sum(slot.mapped_bytes() for slot in slots)
+            logger.info(
+                "DS41 demand KV resident: %.1f MiB physical, %d block ids",
+                physical / (1024 * 1024),
+                len(mapped),
+            )
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -12671,10 +13153,14 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
+        demand_tensors = self._ds41_try_demand_slots(kv_cache_config)
+        for index, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            if demand_tensors is not None:
+                tensor = demand_tensors[index]
+            else:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -13231,3 +13717,29 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+class _DrafterNcclAllReduce:
+    """Callable wrapper around the drafter's graph wrapper: the TP group's custom all-reduce is disabled for the duration
+    of the call (its all-reduces take the NCCL path), attributes pass through to the wrapped object."""
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __call__(self, *args, **kwargs):
+        from vllm.distributed.parallel_state import get_tp_group
+
+        ca = getattr(getattr(get_tp_group(), "device_communicator", None), "ca_comm", None)
+        if ca is None or ca.disabled:
+            return self._inner(*args, **kwargs)
+        ca.disabled = True
+        try:
+            return self._inner(*args, **kwargs)
+        finally:
+            ca.disabled = False
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_inner"), name, value)

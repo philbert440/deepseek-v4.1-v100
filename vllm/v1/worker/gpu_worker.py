@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import gc
+import dataclasses
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
@@ -60,13 +61,16 @@ from vllm.utils.torch_utils import (
     set_random_seed,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.ds41_pp_pipeline import pp_prefill_pipeline_enabled
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker import ds41_stage_timing
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -190,6 +194,20 @@ class Worker(WorkerBase):
                 )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        # DeepSeek-V4.1 pipelined chunked prefill (VLLM_DS41_PP_PREFILL_PIPELINE):
+        # a non-last PP rank may get step k+1 while its GPU still runs step k; it
+        # then waits for this event (recorded after step k's forward) before it
+        # prepares step k+1. See vllm/v1/engine/ds41_pp_pipeline.py.
+        self._ds41_pp_prefill_pipeline = pp_prefill_pipeline_enabled()
+        self._ds41_pp_fwd_done: torch.cuda.Event | None = None
+        # VLLM_DS41_STAGE_TIMING_EVERY=N (default 0 = off): per-PP-stage step timing in
+        # the serve log, see vllm/v1/worker/ds41_stage_timing.py. Built on first use.
+        self._ds41_stage_timing_every = ds41_stage_timing.stage_timing_every()
+        self._ds41_stage_timer: ds41_stage_timing.StageStepTimer | None = None
+        # adaptive slice sizing (VLLM_DS41_SLICE_POLICY=adaptive) needs the decode-step timings even with logging off
+        from vllm.v1 import ds41_slices as _ds41_slices
+
+        self._ds41_slice_feedback_on = _ds41_slices.adaptive_feedback_enabled()
 
     def _has_ple_layers(self) -> bool:
         if not ple_offload_enabled(getattr(self, "vllm_config", None)):
@@ -667,6 +685,18 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        # DeepSeek-V4.1 (VLLM_DS41_ATTN_PRECAPTURE): the per-layer attention graphs are captured after KV sizing
+        # (they bind the real KV tensors), so their pool is taken off the KV budget here instead.
+        from vllm.models.deepseek_v41.sm70.precapture import precapture_reserve_bytes
+
+        ds41_precapture_reserve = precapture_reserve_bytes()
+        if ds41_precapture_reserve:
+            self.available_kv_cache_memory_bytes -= ds41_precapture_reserve
+            logger.info(
+                "DS41 attn precapture: %.0f MiB of the KV budget reserved for the startup decode-graph capture "
+                "(VLLM_DS41_ATTN_PRECAPTURE_RESERVE_MIB)",
+                ds41_precapture_reserve / (1 << 20),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -1080,7 +1110,54 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        if (
+            os.environ.get("VLLM_DS41_FOLD_DRAFTS", "0") == "1"
+            and isinstance(output, ModelRunnerOutput)
+            and output is not EMPTY_MODEL_RUNNER_OUTPUT
+            and output.req_ids
+            and getattr(self.model_runner, "speculative_config", None) is not None
+            and not self.vllm_config.scheduler_config.async_scheduling
+        ):
+            drafts = self.model_runner.take_draft_token_ids()
+            if drafts is not None:
+                output = dataclasses.replace(output, ds41_draft_token_ids=drafts)
+        if getattr(self, "_ds41_stage_timer", None) is not None:
+            self._ds41_stage_timer.finish()
+        if self._ds41_slicer() is not None:
+            output = self._ds41_attach_done(output)
+            deferred = getattr(self, "_ds41_deferred", None)
+            if deferred is not None:
+                deferred[1] = False          # the step's output exists: slices may run after it is sent
+        return output
+
+    def _ds41_get_stage_timer(self) -> "ds41_stage_timing.StageStepTimer | None":
+        """The per-stage step timer on TP rank 0 of each PP stage, when the knob is on."""
+        feedback_on = getattr(self, "_ds41_slice_feedback_on", False)
+        if not getattr(self, "_ds41_stage_timing_every", 0) and not feedback_on:   # tests build Worker via __new__
+            return None
+        if self._ds41_stage_timer is None:
+            if get_tp_group().rank_in_group != 0:
+                self._ds41_stage_timing_every = 0
+                self._ds41_slice_feedback_on = False
+                return None
+            pp = get_pp_group()
+            slicer = self._ds41_slicer()
+            feedback = getattr(slicer, "feedback", None) if feedback_on else None
+            self._ds41_stage_timer = ds41_stage_timing.StageStepTimer(
+                every=self._ds41_stage_timing_every,
+                pp_rank=pp.rank_in_group,
+                is_last=pp.is_last_rank,
+                log=logger.info,
+                on_step=feedback.note_decode if feedback is not None else None,
+            )
+            logger.info(
+                "DS41 stage timing on (%s=%d), pp_rank=%d",
+                ds41_stage_timing.STAGE_TIMING_KNOB,
+                self._ds41_stage_timing_every,
+                pp.rank_in_group,
+            )
+        return self._ds41_stage_timer
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
         """Whether this step has the exact metadata-free PP tensor contract."""
@@ -1281,6 +1358,14 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        ds41_slicer = self._ds41_slicer()
+        if ds41_slicer is not None:
+            # Layer-sliced prefill: the previous step's deferred last-stage slices (if the
+            # busy loop has not run them after its response), then, before this step's PP
+            # receive / forward writes the per-step buffers a held chunk lives in, save
+            # their low rows.
+            self._ds41_flush_deferred()
+            ds41_slicer.pre_step(scheduler_output)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1290,6 +1375,9 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        stage_timer = self._ds41_get_stage_timer()
+        if stage_timer is not None:
+            stage_timer.begin(scheduler_output)
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
@@ -1364,17 +1452,28 @@ class Worker(WorkerBase):
                     )
                 )
             assert tensor_dict is not None
+            if stage_timer is not None:
+                # Runs after the irecv handles were waited on the compute stream.
+                comm_postprocess = [*(comm_postprocess or ()), stage_timer.recv_done]
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
 
+        if getattr(self, "_ds41_pp_fwd_done", None) is not None:   # tests build Worker via __new__
+            # Stage-local only: this rank's previous forward, not the later stages.
+            self._ds41_pp_fwd_done.synchronize()
+            self._ds41_pp_fwd_done = None
+
+        ds41_output_ready = False
         try:
             with self.annotate_profile(scheduler_output):
                 output = self.model_runner.execute_model(
                     scheduler_output, intermediate_tensors
                 )
+                if stage_timer is not None:
+                    stage_timer.fwd_done()
                 if (
                     self.use_v2_model_runner
                     and self.model_runner.is_pooling_model
@@ -1384,15 +1483,28 @@ class Worker(WorkerBase):
                 if isinstance(
                     output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
                 ):
-                    return output
+                    if stage_timer is not None and output is not None:
+                        stage_timer.finish()   # else: sample_tokens finishes the step
+                    if self._ds41_slicer() is None:
+                        return output
+                    ds41_output_ready = True
         finally:
             # D11 ENGRAM F2: the forward (and every wait_rows in it) has been
             # issued; retire this step's gather so its slot/tickets are free.
             # Also on an exception, so an aborted step never pins its slot.
             if engram_step_id is not None:
                 engram_service.end_step(engram_step_id)
+        if ds41_output_ready:
+            # DeepSeek-V4.1 layer-sliced prefill on the last stage / an empty step: the
+            # staged slices run after the decode forward (no decode payload to send here).
+            return self._ds41_run_slices(scheduler_output, output)
 
         assert isinstance(output, IntermediateTensors)
+        if stage_timer is not None:
+            stage_timer.finish()
+        if self._ds41_pp_prefill_pipeline and forward_pass:
+            self._ds41_pp_fwd_done = torch.cuda.Event()
+            self._ds41_pp_fwd_done.record()
         parallel_config = self.vllm_config.parallel_config
         assert (
             parallel_config.distributed_executor_backend != "external_launcher"
@@ -1421,7 +1533,93 @@ class Worker(WorkerBase):
                 all_gather_tensors=all_gather_tensors,
             )
 
+        if self._ds41_slicer() is not None:
+            # Layer-sliced prefill: after the decode payload's isend, this stage's slices
+            # (and the staged chunk's handoff isend, in directive order).
+            self._ds41_run_slices(scheduler_output, None)
+            if self._ds41_pp_prefill_pipeline and getattr(self, "_ds41_pp_fwd_done", None) is not None:
+                self._ds41_pp_fwd_done = torch.cuda.Event()
+                self._ds41_pp_fwd_done.record()
         return None
+
+    # ---- DeepSeek-V4.1 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL; ds41_sliced_prefill.py) ----
+    def _ds41_slicer(self) -> Any | None:
+        return getattr(self.model_runner, "_ds41_slicer", None)
+
+    def _ds41_run_slices(self, scheduler_output: "SchedulerOutput", output: Any) -> Any:
+        """Run this stage's slice directives; on the last stage report completed chunks in the
+        step's ModelRunnerOutput (now, or in sample_tokens when execute_model returned None)."""
+        slicer = self._ds41_slicer()
+        if slicer is None:
+            return output
+        if slicer.is_last and slicer.pp_size > 1 and self._ds41_slices_after_sample():
+            # The last stage's slices run after this step's sampled output is sent
+            # (ds41_after_response, from the worker busy loop): the decoder's next step
+            # does not wait behind them. Their slice_done rides the next output.
+            if getattr(scheduler_output, "ds41_slices", ()) or getattr(
+                scheduler_output, "ds41_slice_aborts", ()
+            ):
+                self._ds41_deferred = [scheduler_output, output is None]
+            return output if output is None else self._ds41_attach_done(output)
+        if slicer.on_staged is None and slicer.is_first and self._engram_service() is not None:
+            # the Engram step planner must know the staged prompt ids: the request's
+            # normal-path tail resolves its positions from them (begin_step)
+            slicer.on_staged = self._engram_planner.note_staged
+        done = slicer.run_step(scheduler_output)
+        if not slicer.is_last:
+            return output
+        slicer.pending_done.extend(done)
+        if output is None:
+            return None
+        return self._ds41_attach_done(output)
+
+    def _ds41_slices_after_sample(self) -> bool:
+        cached = getattr(self, "_ds41_after_sample_cache", None)
+        if cached is None:
+            cached = os.environ.get("VLLM_DS41_SLICE_S1_AFTER_SAMPLE", "1") == "1"
+            if cached and os.environ.get("VLLM_DS41_PP_NO_EMPTY_STEP", "0") == "1":
+                # a deferred slice_done rides the NEXT output; with empty steps skipped there
+                # may be none (decoder finished, staged request waiting on it)
+                logger.warning(
+                    "DS41 sliced prefill: VLLM_DS41_PP_NO_EMPTY_STEP=1 -> last-stage slices run "
+                    "before the step's output (VLLM_DS41_SLICE_S1_AFTER_SAMPLE ignored)"
+                )
+                cached = False
+            self._ds41_after_sample_cache = cached
+        return cached
+
+    def ds41_after_response(self) -> None:
+        """Worker busy loop, after each RPC's response: run the last stage's deferred slices
+        once the step's output has been sent (not between execute_model and sample_tokens)."""
+        deferred = getattr(self, "_ds41_deferred", None)
+        if deferred is None or deferred[1]:
+            return
+        self._ds41_flush_deferred()
+
+    def _ds41_flush_deferred(self) -> None:
+        deferred = getattr(self, "_ds41_deferred", None)
+        if deferred is None:
+            return
+        self._ds41_deferred = None
+        slicer = self._ds41_slicer()
+        with torch.inference_mode():
+            slicer.pending_done.extend(slicer.run_step(deferred[0]))
+
+    def _ds41_attach_done(self, output: Any) -> Any:
+        slicer = self._ds41_slicer()
+        if slicer is None or not isinstance(output, ModelRunnerOutput):
+            return output
+        if getattr(slicer, "feedback", None) is not None and slicer.is_last:
+            # adaptive slice sizing: this stage's and the previous stage's measured costs
+            from vllm.v1.worker.ds41_sliced_prefill import attach_feedback
+
+            output = attach_feedback(output, *slicer.take_feedback())
+        if not slicer.pending_done:
+            return output
+        from vllm.v1.worker.ds41_sliced_prefill import attach_slice_done
+
+        done, slicer.pending_done = slicer.pending_done, []
+        return attach_slice_done(output, done)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
@@ -1736,6 +1934,23 @@ class _EngramStepPlanner:
         self._step = 0
         self._tokens: dict[str, np.ndarray] = {}
 
+    def note_staged(self, req_id: str, start_pos: int, token_ids: np.ndarray) -> None:
+        """Layer-sliced prefill (stage 0 ``first``): the staged chunk's prompt ids, so the
+        request's later normal-path step (its non-staged tail) resolves its token ids even
+        when it arrives as a cached request without ``new_token_ids`` (EngramReqStep must
+        carry token_ids or prompt_token_ids past the staged positions)."""
+        ids = np.asarray(token_ids, dtype=np.int32)
+        start = int(start_pos)
+        known = self._tokens.get(req_id)
+        if known is None:
+            if start == 0:
+                self._tokens[req_id] = ids.copy()
+            return
+        if start > len(known):
+            return   # gap: leave it, the Engram service raises on a real gap
+        if start + len(ids) > len(known):
+            self._tokens[req_id] = np.concatenate([known[:start], ids]).astype(np.int32, copy=False)
+
     def plan(self, scheduler_output: "SchedulerOutput") -> Any:
         from vllm.models.deepseek_v41.common.contracts import EngramReqStep, EngramStepPlan
 
@@ -1774,10 +1989,14 @@ class _EngramStepPlanner:
                     self._tokens[req_id] = prompt
                 if cached.new_token_ids:
                     main = np.asarray(cached.new_token_ids[i], dtype=np.int32)
-                    if len(main) != num_main:
+                    if len(main) < num_main:
                         raise ValueError(
                             f"request {req_id}: {len(main)} new_token_ids for {num_main} scheduled tokens"
                         )
+                    # PP + spec decode: the scheduler sends every token this stage lacks (accepted drafts +
+                    # bonus). The accepted drafts already sit in the Engram history at their positions with
+                    # these very values (written as drafts last step); this step's main tokens are the tail.
+                    main = main[-num_main:]
                 else:
                     known = self._tokens.get(req_id)
                     main = (

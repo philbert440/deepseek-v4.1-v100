@@ -6,6 +6,7 @@ loaders (synthetic, or real tensors from VERIFIED official shards)."""
 
 from __future__ import annotations
 
+import os
 import json
 import math
 import random
@@ -28,7 +29,7 @@ from vllm.models.deepseek_v41.common.contracts import (
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
-REF_DIR = Path("/mnt/nvme2/scratch/ds41/model-ref")
+REF_DIR = Path(os.environ.get("DS41_MODEL_REF", "/mnt/nvme2/scratch/ds41/model-ref"))
 CKPT_DIR = Path("/mnt/nvme2/models/DeepSeek-V4.1-Flash")
 VERIFY = Path("/mnt/nvme2/models/_dl-logs/verify_shard.sh")
 
@@ -102,7 +103,9 @@ class SimKV:
             if isinstance(layer, DS41CacheLayer) and name not in self.caches:
                 spec = layer.get_kv_cache_spec(self.vcfg)
                 storage = spec.storage_block_size
-                t = torch.full((self.num_blocks, storage, spec.head_size), float("nan"), dtype=spec.dtype,
+                # poison: NaN rows; a packed FP4 compressed record (uint8) with scale bytes 0x7F unpacks to NaN
+                poison = float("nan") if spec.dtype.is_floating_point else 0x7F
+                t = torch.full((self.num_blocks, storage, spec.head_size), poison, dtype=spec.dtype,
                                device=self.device)
                 layer.bind_kv_cache(t)
                 free = list(range(1, self.num_blocks))      # block 0 = null block
@@ -377,6 +380,8 @@ def ref_attention(cfg: SimpleNamespace, topo: LayerTopology, w: dict[str, torch.
             st.ik[topo.layer_id] = qat.fp4_e8m0_qdq(_rot(k, fpos), out_dtype=torch.float32, impl="torch")
             st.ckv[topo.layer_id] = qat.fp4_e4m3_qdq(_rot(latent, fpos), out_dtype=torch.float32, impl="torch")
             if ckv_records is not None:          # substitution experiments: another path's compressed records
+                if ckv_records.dtype == torch.uint8:          # packed FP4 x E4M3/16 records -> values
+                    ckv_records = qat.unpack_ckv_torch(ckv_records)
                 if ckv_records.shape != st.ckv[topo.layer_id].shape:
                     raise ValueError(f"ckv_records {tuple(ckv_records.shape)} != {tuple(st.ckv[topo.layer_id].shape)}")
                 st.ckv[topo.layer_id] = ckv_records.float()
@@ -426,6 +431,9 @@ def ref_attend(q: torch.Tensor, kv_win: torch.Tensor, ckv: torch.Tensor | None, 
     dev = q.device
     o = torch.zeros((S, q.shape[1], 512), device=dev)
     sink = sink.float()
+    if ckv is not None and ckv.dtype == torch.uint8:        # packed FP4 x E4M3/16 records (CKV_PACKED_DIM) -> values
+        from vllm.models.deepseek_v41.common.qat import unpack_ckv_torch
+        ckv = unpack_ckv_torch(ckv)
     for a in range(0, rows.numel(), 128):
         rr = rows[a: a + 128]
         win = rr[:, None] - 127 + torch.arange(128, device=dev)[None, :]

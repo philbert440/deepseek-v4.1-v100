@@ -338,3 +338,30 @@ def test_failed_ctor_releases_scale_registration(syn: SyntheticEngram, monkeypat
     monkeypatch.delenv("VLLM_DS41_ENGRAM_IO_THREADS")
     svc = make_service(syn)
     svc.shutdown()
+
+
+def test_lookahead_chunked_prefill_identical(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
+    """VLLM_DS41_ENGRAM_LOOKAHEAD_TOKENS: chunk k+1's rows gathered during chunk k stage the same bytes as today's
+    path, including through the H2D and the device expansion (CPU twin: test_engram_lookahead.py)."""
+    p = np.random.default_rng(9).integers(3, 129000, size=600).astype(np.int32)
+    chunks = [(0, 128), (128, 128), (256, 100), (356, 244)]
+    outs = {}
+    for la in ("0", "128"):
+        monkeypatch.setenv("VLLM_DS41_ENGRAM_LOOKAHEAD_TOKENS", la)
+        svc = make_service(syn, tp_rank=2, max_tokens=256)
+        try:
+            orc = Oracle(svc, syn)
+            orc.set("Q", 0, p)
+            outs[la] = []
+            for k, (s, n) in enumerate(chunks):
+                got = run_step(svc, k, [EngramReqStep("Q", s, n, None, p if k == 0 else None)], ["Q"], 256)
+                expect(orc, got, [("Q", s, n)], 256)
+                outs[la].append(got)
+                svc.end_step(k)
+            if la != "0":
+                assert svc.stats()["lookahead_hits"] > 0
+        finally:
+            svc.shutdown()
+    for a, b in zip(outs["0"], outs["128"]):
+        for lid in a:
+            np.testing.assert_array_equal(a[lid], b[lid])

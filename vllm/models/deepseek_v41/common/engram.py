@@ -515,6 +515,30 @@ class DeepseekV41Engram(nn.Module):
         self.wkv_r.data.copy_(w16)
 
     # ---- forward ----
+    def sp_rows(self, T: int) -> torch.Tensor:
+        """Sequence-parallel HC (sm70/sp_hc.py): this rank's UN-REDUCED wkv output for all T rows of the step,
+        [T, 25600] fp32 (the caller reduce-scatters it); one chunk, the same GEMM / bias math as ``forward``."""
+        rows = self.service.rows_buffer(self.layer_id, T)
+        _eager_wait()(self.service, self.layer_id, rows)
+        row_bias = self.service.row_bias(self.layer_id)
+        alpha = 2.0 ** -(WKV_BIAS_LOG2 + row_bias)
+        if self.impl == "sm70":
+            from vllm.models.deepseek_v41.sm70 import engram_kernels as ek
+            x16 = ek.decode_rows(rows[:T], row_bias)
+        else:
+            x16 = decode_rows_torch(rows[:T], row_bias)
+        part = torch.mm(x16, self.wkv_r.t(), out_dtype=torch.float32)
+        part.mul_(alpha)
+        return part
+
+    def sp_gate(self, stream_shard: torch.Tensor, kv_shard: torch.Tensor) -> None:
+        """In place on this rank's stream rows with the SUMMED wkv rows (the reduce-scatter of ``sp_rows``)."""
+        if self.impl == "sm70":
+            from vllm.models.deepseek_v41.sm70 import engram_kernels as ek
+            ek.post_wkv_gate_(stream_shard, kv_shard, self.qk, 1.0)
+        else:
+            post_wkv_gate_torch_(stream_shard, kv_shard, self.qk, 1.0)
+
     def forward(self, stream: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """stream [T_pad, 4, 5120] bf16, updated IN PLACE and returned (ref:m.py:350-365). ``positions`` is unused:
         the rows were hashed on the CPU from token ids (EngramHostService)."""

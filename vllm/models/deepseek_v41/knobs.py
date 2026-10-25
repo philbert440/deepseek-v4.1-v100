@@ -61,6 +61,25 @@ def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int
     return result
 
 
+def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Finite float; unset or empty -> default. Bounds are inclusive and checked on the default too."""
+    value = _raw(name)
+    if value is None:
+        result = float(default)
+    else:
+        try:
+            result = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{name}={value!r} is not a number") from exc
+        if result != result or result in (float("inf"), float("-inf")):
+            raise ValueError(f"{name}={value!r} is not finite")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name}={result} is below the minimum {minimum}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name}={result} is above the maximum {maximum}")
+    return result
+
+
 def env_str(name: str, default: str, *, choices: tuple[str, ...] | None = None) -> str:
     """Raw string; unset or empty -> default. With ``choices`` the value (and the default) must be one of them."""
     value = _raw(name)

@@ -37,7 +37,9 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1 import ds41_slices
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched import ds41_sliced_prefill
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -75,6 +77,9 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
 
 
 class Scheduler(SchedulerInterface):
+    # DS41 layer-sliced prefill planner (set in __init__; class default for schedulers built via __new__).
+    _ds41_slicer: "ds41_sliced_prefill.SlicePlanner | None" = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -286,6 +291,15 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # DS41 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL=1, default off): see
+        # vllm/v1/core/sched/ds41_sliced_prefill.py. Active only under PP2 (checked per step).
+        self._ds41_slicer = None
+        if ds41_slices.sliced_prefill_enabled():
+            if self.connector is not None:
+                raise ValueError(f"{ds41_slices.SLICED_PREFILL_KNOB}=1 does not support a KV connector")
+            self._ds41_slicer = ds41_sliced_prefill.make_planner(
+                vllm_config, self.max_num_scheduled_tokens
+            )
         self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -634,12 +648,28 @@ class Scheduler(SchedulerInterface):
                 self.max_num_scheduled_tokens // num_eligible_reqs,
             )
 
+        # DS41 layer-sliced prefill: while a request decodes, long prompts' non-final chunks are staged instead of
+        # run on the normal path (ds41_sliced_prefill.py); with no decoder left, chunks still on a stage fall back.
+        slicer = self._ds41_active_slicer()
+        ds41_decoders = False
+        if slicer is not None:
+            ds41_decoders = any(
+                ds41_sliced_prefill.is_decoding(r) and not slicer.is_staged(r.request_id)
+                for r in self.running
+            )
+            if not ds41_decoders:
+                slicer.abort_active("no_decoder")
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             if self.current_step < request.next_decode_eligible_step:
+                req_index += 1
+                continue
+
+            if slicer is not None and slicer.blocks_normal(request, ds41_decoders):
                 req_index += 1
                 continue
 
@@ -659,11 +689,30 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                request.num_output_placeholders == 0
+                and request.num_computed_tokens >= request.num_tokens
+            ):
+                # Pipeline-parallel batch queue: a step of this request is still in flight (its sampled token is not
+                # processed yet) and the drafter's tokens for it may already be attached. Scheduling now would verify
+                # the drafts without their anchor (the worker asserts scheduled >= drafts + 1 and the stages
+                # deadlock). Wait for the output. This must not depend on the request HAVING drafts: with a variable
+                # draft length (DSpark p_min / confidence prefix, ngram) the drafter can propose zero, and then
+                # num_new_tokens = num_tokens - num_computed_tokens = -(drafts of the in-flight step) < 0 reached the
+                # worker (_prepare_inputs: assert total_num_scheduled_tokens > 0, 2026-10-20).
+                req_index += 1
+                continue
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.spec_token_ids and self.__dict__.setdefault("_ds41_spec_logs", 0) < 6:
+                self._ds41_spec_logs += 1
+                logger.info("DS41 sched: req %s num_tokens %d (prompt %d, output %d) spec %d placeholders %d computed %d "
+                            "-> num_new %d", request.request_id, request.num_tokens, request.num_prompt_tokens,
+                            request.num_output_tokens, len(request.spec_token_ids), request.num_output_placeholders,
+                            request.num_computed_tokens, num_new_tokens)
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
@@ -768,7 +817,8 @@ class Scheduler(SchedulerInterface):
                     )
                     num_new_tokens -= num_scheduled_spec_tokens - flat_len
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
+                # (A negative count must never be scheduled: it corrupts the step and the token budget.)
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -913,6 +963,15 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        if (
+            slicer is not None
+            and ds41_decoders
+            and not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and any(ds41_sliced_prefill.is_decoding(r) for r in scheduled_running_reqs)
+        ):
+            ds41_sliced_prefill.stage_next(self, slicer, scheduled_timestamp)
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -961,6 +1020,12 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if slicer is not None and slicer.defer_waiting(request, ds41_decoders):
+                    # DS41 sliced prefill: a long fresh prompt waits for stage 0 instead of stalling the decoder.
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -1226,6 +1291,21 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs
         ) <= len(self.running)
 
+        ds41_step_slices: tuple = ()
+        ds41_step_aborts: tuple = ()
+        if self._ds41_slicer is not None:
+            if slicer is not None:
+                self._ds41_normal_path_fixups(
+                    scheduled_running_reqs, scheduled_new_reqs, req_to_new_blocks
+                )
+                ds41_step_slices = slicer.emit(
+                    self.kv_cache_manager,
+                    decode_in_step=any(
+                        ds41_sliced_prefill.is_decoding(r) for r in scheduled_running_reqs
+                    ),
+                )
+            ds41_step_aborts = self._ds41_slicer.take_aborts()
+
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -1274,6 +1354,11 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        # Always drain. Hashed free blocks are not included, so a prefix hit
+        # stays resident. An empty list is sent as None.
+        demand_release_block_ids = (
+            self.kv_cache_manager.take_demand_release_ids() or None
+        )
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
@@ -1315,9 +1400,12 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            demand_release_block_ids=demand_release_block_ids,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
+            ds41_slices=ds41_step_slices,
+            ds41_slice_aborts=ds41_step_aborts,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1342,6 +1430,56 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _ds41_active_slicer(self) -> "ds41_sliced_prefill.SlicePlanner | None":
+        slicer = self._ds41_slicer
+        if (
+            slicer is None
+            or not self.use_pp
+            or self.parallel_config.pipeline_parallel_size != 2
+            or self.scheduler_config.async_scheduling
+        ):
+            return None
+        return slicer
+
+    def _ds41_normal_path_fixups(
+        self,
+        scheduled_running_reqs: list[Request],
+        scheduled_new_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+    ) -> None:
+        """A request staged straight from the waiting queue reaches the workers for the first time in its first
+        normal step: send it as a new request with its full block table. A request the workers already hold gets
+        the blocks allocated while it was staged appended to this step's new blocks."""
+        slicer = self._ds41_slicer
+        assert slicer is not None
+        for request in list(scheduled_running_reqs):
+            req_id = request.request_id
+            if req_id in slicer.unseen:
+                slicer.unseen.discard(req_id)
+                scheduled_running_reqs.remove(request)
+                scheduled_new_reqs.append(request)
+                req_to_new_blocks[req_id] = self.kv_cache_manager.get_blocks(req_id)
+            elif req_id in slicer.pending_blocks:
+                req_to_new_blocks[req_id] = (
+                    slicer.pending_blocks.pop(req_id) + req_to_new_blocks[req_id]
+                )
+
+    def _ds41_commit_slices(self, done: Iterable[tuple[str, int]]) -> None:
+        """slice_done from the last stage: the chunk's KV is complete; advance and hash it."""
+        slicer = self._ds41_slicer
+        assert slicer is not None
+        for key in done:
+            chunk = slicer.complete(key)
+            if chunk is None:
+                continue        # aborted / preempted while its last slice was in flight
+            request = self.requests.get(chunk.req_id)
+            if request is None or request.is_finished():
+                continue
+            assert request.num_computed_tokens == chunk.start, (
+                key, request.num_computed_tokens, chunk.start)
+            request.num_computed_tokens = chunk.end
+            self.kv_cache_manager.cache_blocks(request, chunk.end)
+
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1356,6 +1494,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        ds41_unseen = False
+        if self._ds41_slicer is not None:
+            ds41_unseen = request.request_id in self._ds41_slicer.unseen
+            self._ds41_slicer.drop_request(request.request_id, "preempt")
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1363,6 +1505,9 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        if ds41_unseen:
+            # Staged straight from the waiting queue: the workers never saw it, so it restarts as a new request.
+            request.status = RequestStatus.WAITING
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -1487,9 +1632,15 @@ class Scheduler(SchedulerInterface):
                 num_tokens = num_scheduled_tokens[req_id] - len(
                     spec_decode_tokens.get(req_id, ())
                 )
-                token_ids = req.all_token_ids[
-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
-                ]
+                # Send every token the non-last stages do not hold yet: after a verify step that
+                # accepted k drafts the stage's non-spec history ends k tokens earlier than
+                # num_computed_tokens, so start from the last position sent (DS41 PP+spec fix).
+                end = req.num_computed_tokens + num_tokens
+                sent_upto = getattr(req, "pp_sent_upto", None)
+                if sent_upto is None or sent_upto > req.num_computed_tokens:
+                    sent_upto = req.num_computed_tokens
+                token_ids = req.all_token_ids[sent_upto:end]
+                req.pp_sent_upto = end
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
@@ -1708,6 +1859,14 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
+        if self._ds41_slicer is not None:
+            ds41_done = getattr(model_runner_output, "ds41_slice_done", ())
+            if ds41_done:
+                self._ds41_commit_slices(ds41_done)
+            self._ds41_slicer.observe(
+                getattr(model_runner_output, "ds41_slice_ms", ()),
+                getattr(model_runner_output, "ds41_decode_ms", ()),
+            )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1786,6 +1945,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+            if self.__dict__.setdefault("_ds41_out_logs", 0) < 6:
+                self._ds41_out_logs += 1
+                logger.info("DS41 output: req %s idx %d sampled %s (num_sampled rows %d) spec_scheduled %s computed %d",
+                            req_id, req_index, (sampled_token_ids[req_index] if sampled_token_ids else None),
+                            len(sampled_token_ids) if sampled_token_ids else -1,
+                            scheduler_output.scheduled_spec_decode_tokens.get(req_id), request.num_computed_tokens)
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -2132,6 +2297,14 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
+            ds41_slicer = getattr(self, "_ds41_slicer", None)
+            if ds41_slicer is not None and (
+                ds41_slicer.is_staged(req_id) or req_id in ds41_slicer.unseen
+            ):
+                # DS41 sliced prefill: a staged prompt has no drafts.
+                request.spec_token_ids = []
+                continue
+
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
@@ -2374,6 +2547,8 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if self._ds41_slicer is not None:
+            self._ds41_slicer.forget(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

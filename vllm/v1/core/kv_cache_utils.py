@@ -136,6 +136,12 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # DeepSeek-V4.1 decoder replay (``vllm/v1/core/ds41_replay.py``): whether
+    # the KV of every row in this block was computed exactly in all layers.
+    # Set whenever the block is hashed, reset with the hash. Always True when
+    # the replay trim is off.
+    replay_deep: bool = True
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -150,6 +156,7 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        self.replay_deep = True
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -1507,6 +1514,15 @@ def _get_kv_cache_config_deepseek_v41(
         raise ValueError("DeepSeek-V4.1 KV cache plan is empty")
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    from collections import Counter
+    pages = Counter(ps for ps, _ in plan)
+    layers = Counter(name.split(".")[-1] if not name.split(".")[-1].isdigit() else "layer"
+                     for _, shared in plan for name in shared)
+    logger.info("DeepSeek-V4.1 KV plan: available %.3f GiB, %d tensors/block (page KiB x count: %s), "
+                "%.1f KiB per block, %d blocks; layers per cache kind: %s",
+                available_memory / 2**30, len(plan),
+                ", ".join(f"{ps // 1024}x{n}" for ps, n in sorted(pages.items())),
+                bytes_per_block / 1024, num_blocks, dict(layers))
     return num_blocks, [
         KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
         for ps, shared_by in plan
@@ -2531,10 +2547,24 @@ def _select_deepseek_v4_tuple_width(
             for tuple_count, page_count in zip(tuple_counts, page_counts)
         )
 
-    return min(
+    best = min(
         range(min_width, max_width + 1),
         key=lambda width: (pool_pages(width), width),
     )
+    # DeepSeek-V4.1 SM70: the width is also the number of KV cache groups, i.e. block tables, slot-mapping
+    # kernels and metadata builds per step; memory-optimal widths put every layer in its own group (~45 builds per
+    # decode step). VLLM_DS41_KV_TUPLE_WIDTH overrides (clamped); the table logs the page cost of every width.
+    import os
+    table = ", ".join(f"{w}:{pool_pages(w)}" for w in range(min_width, max_width + 1))
+    logger.info("DeepSeek-V4 KV tuple width: min %d max %d, pool pages per width {%s}; memory-optimal %d",
+                min_width, max_width, table, best)
+    override = os.environ.get("VLLM_DS41_KV_TUPLE_WIDTH")
+    if override:
+        width = max(min_width, min(max_width, int(override)))
+        logger.info("DeepSeek-V4 KV tuple width override: %d (pool pages %d vs %d optimal)", width, pool_pages(width),
+                    pool_pages(best))
+        return width
+    return best
 
 
 def _get_kv_cache_groups_uniform_groups(
@@ -3207,6 +3237,17 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    if os.environ.get("VLLM_DS41_ATTN_PRECAPTURE", "0") == "1":
+        # DS41 precapture: which worker (PP stage) sets the shared block count, so a capture-memory cut is spent on
+        # the stage that binds (the others' reserve does not change the pool)
+        logger.info(
+            "DS41 KV blocks per worker (available GiB / blocks): %s -> min %d",
+            ", ".join(
+                f"w{i} {format_gib(mem)}/{cfg.num_blocks}"
+                for i, (mem, cfg) in enumerate(zip(available_memory, kv_cache_configs))
+            ),
+            min_num_blocks,
+        )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks

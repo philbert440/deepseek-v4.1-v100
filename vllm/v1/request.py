@@ -169,6 +169,10 @@ class Request:
         self.is_prefill_chunk = False
         # Detected cross-request junction to retain for subsequent sparse reuse.
         self.shared_prefix_boundary = 0
+        # DeepSeek-V4.1 decoder replay: first position whose KV the current
+        # pass computes exactly in every layer (see vllm/v1/core/ds41_replay.py).
+        # Set by KVCacheManager.get_computed_blocks; 0 when the trim is off.
+        self.replay_exact_from = 0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

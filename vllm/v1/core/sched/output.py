@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.ds41_slices import SliceDirective
     from vllm.v1.request import Request
     from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 else:
@@ -27,6 +28,7 @@ else:
     SamplingParams = object
     DDTreeDraftPayload = object
     Request = object
+    SliceDirective = object
 
 
 @dataclass
@@ -252,10 +254,21 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Block ids the worker may unmap. Omitted when the block is still a
+    # prefix-cache hit. Hashed free blocks stay mapped until eviction.
+    demand_release_block_ids: list[int] | None = None
+
     # Exact Mamba ``align`` boundary-state sources offered to a KV connector:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
     # Scheduler-local; cleared after connector metadata is built.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
+    # DS41 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL=1; vllm/v1/ds41_slices.py, hol-design.md Appendix A).
+    # The same tuple goes to every PP stage; each runs the directives whose ``stage`` is its rank, in order, after
+    # the step's decode/verify batch. Aborts: (req_id, chunk_id) whose per-chunk worker state must be dropped
+    # (KV blocks are freed by the scheduler, not the workers).
+    ds41_slices: "tuple[SliceDirective, ...]" = ()
+    ds41_slice_aborts: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

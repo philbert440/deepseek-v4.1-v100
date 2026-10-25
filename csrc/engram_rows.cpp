@@ -15,6 +15,15 @@
 // pread collects the misses. Low-priority prefetch jobs only issue WILLNEED (admission warm-up of the page
 // cache). O_DIRECT mode bypasses the page cache (cold-path measurements): aligned bounce-buffer reads, QD =
 // threads. Every I/O failure is reported with file, offset and errno; nothing is retried silently.
+//
+// Queues: high (the step's gather) > mid (lookahead gathers of the next prompt chunk, priority 1) > low (admission
+// WILLNEED warm-up). Workers claim chunks from the first job with unclaimed rows, so a new step's gather overtakes
+// a lookahead that is still in flight.
+//
+// ZFS (OpenZFS 2.4 here) refuses RWF_NOWAIT (ENOTSUP), so every gathered row takes step (2)+(3), and its WILLNEED
+// becomes a ZFS async-read-class I/O (zfs_vdev_async_read_max_active = 3 per vdev) that the blocking pread then waits
+// on. set_gather_willneed(false) skips step (2): misses are plain blocking preads, i.e. sync-read class (10 per vdev),
+// with device queue depth = reader threads.
 
 #include <torch/extension.h>
 
@@ -169,7 +178,9 @@ class RowReader {
   // Gather rows: for i in [0, n): row_bytes from files[file_idx[i]] at offsets[i] -> dst + i * dst_stride, then
   // extra_bytes from tables[xtab[i]] entry xidx[i] -> dst + i * dst_stride + row_bytes (xtab[i] < 0: no extra).
   int64_t submit(torch::Tensor file_idx, torch::Tensor offsets, torch::Tensor xtab, torch::Tensor xidx,
-                 torch::Tensor dst, int64_t dst_stride, int64_t row_bytes) {
+                 torch::Tensor dst, int64_t dst_stride, int64_t row_bytes, int64_t priority) {
+    TORCH_CHECK(priority == 0 || priority == 1, "Engram RowReader: submit priority must be 0 (step) or 1 (lookahead), got ",
+                priority);
     const int64_t n = offsets.numel();
     check_index_inputs(file_idx, offsets, n, row_bytes);
     TORCH_CHECK(xtab.device().is_cpu() && xtab.scalar_type() == at::kInt && xtab.is_contiguous() &&
@@ -211,7 +222,7 @@ class RowReader {
     job->xtab = job->xtab_v.data();
     job->xidx = job->xidx_v.data();
     job->dst = dst.data_ptr<uint8_t>();
-    return enqueue(job, /*high=*/true);
+    return enqueue(job, priority == 0 ? Queue::kHigh : Queue::kMid);
   }
 
   // Low priority page-cache warm-up: WILLNEED for each row's page span (no data copy).
@@ -227,7 +238,7 @@ class RowReader {
     job->off_v.assign(offsets.data_ptr<int64_t>(), offsets.data_ptr<int64_t>() + n);
     job->file_idx = job->file_v.data();
     job->offsets = job->off_v.data();
-    return enqueue(job, /*high=*/false);
+    return enqueue(job, Queue::kLow);
   }
 
   bool done(int64_t ticket) {
@@ -271,6 +282,8 @@ class RowReader {
   std::vector<int64_t> file_sizes() const { return sizes_; }
   bool o_direct() const { return o_direct_; }
   int64_t num_threads() const { return static_cast<int64_t>(threads_.size()); }
+  void set_gather_willneed(bool on) { gather_willneed_.store(on); }
+  bool gather_willneed() const { return gather_willneed_.load(); }
 
  private:
   void check_index_inputs(const torch::Tensor& file_idx, const torch::Tensor& offsets, int64_t n,
@@ -291,7 +304,9 @@ class RowReader {
     }
   }
 
-  int64_t enqueue(std::shared_ptr<Job> job, bool high) {
+  enum class Queue { kHigh, kMid, kLow };
+
+  int64_t enqueue(std::shared_ptr<Job> job, Queue q) {
     std::lock_guard<std::mutex> g(mu_);
     TORCH_CHECK(!stop_, "Engram RowReader is shut down");
     job->id = next_id_++;
@@ -303,7 +318,7 @@ class RowReader {
       if (job->prefetch_only) jobs_.erase(job->id);
       return job->id;
     }
-    (high ? high_ : low_).push_back(job);
+    (q == Queue::kHigh ? high_ : q == Queue::kMid ? mid_ : low_).push_back(job);
     cv_.notify_all();
     return job->id;
   }
@@ -315,10 +330,10 @@ class RowReader {
     return it->second;
   }
 
-  // Under mu_: first job with unclaimed rows, high queue first. Fully-claimed jobs leave the queues into
+  // Under mu_: first job with unclaimed rows: high queue first, then mid, then low. Fully-claimed jobs leave the queues into
   // `grave`, which the caller drops AFTER unlocking (a tensor deleter may need the GIL: never under mu_).
   std::shared_ptr<Job> pick_locked(std::vector<std::shared_ptr<Job>>& grave) {
-    for (auto* q : {&high_, &low_}) {
+    for (auto* q : {&high_, &mid_, &low_}) {
       while (!q->empty()) {
         auto& j = q->front();
         if (j->next.load() < j->n) return j;
@@ -433,6 +448,7 @@ class RowReader {
       }
     }
     for (int64_t i : miss) {  // submit every miss to the device before blocking on any of them
+      if (!gather_willneed_.load(std::memory_order_relaxed)) break;
       const int64_t off = job.offsets[i];
       const int64_t a = off / kPage * kPage;
       const int64_t b = (off + job.row_bytes + kPage - 1) / kPage * kPage;
@@ -495,11 +511,12 @@ class RowReader {
   std::vector<std::thread> threads_;
   std::mutex mu_;
   std::condition_variable cv_;
-  std::deque<std::shared_ptr<Job>> high_, low_;
+  std::deque<std::shared_ptr<Job>> high_, mid_, low_;
   std::unordered_map<int64_t, std::shared_ptr<Job>> jobs_;
   int64_t next_id_ = 1;
   bool stop_ = false;
   std::atomic<bool> nowait_ok_{true};
+  std::atomic<bool> gather_willneed_{true};
 };
 
 }  // namespace
@@ -512,7 +529,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("add_table", &RowReader::add_table, py::arg("table"), py::arg("entry_bytes"))
       .def("submit", &RowReader::submit, py::arg("file_idx"), py::arg("offsets"), py::arg("xtab"),
            py::arg("xidx"), py::arg("dst"), py::arg("dst_stride"), py::arg("row_bytes"),
-           py::call_guard<py::gil_scoped_release>())
+           py::arg("priority") = 0, py::call_guard<py::gil_scoped_release>())
       .def("prefetch", &RowReader::prefetch, py::arg("file_idx"), py::arg("offsets"), py::arg("row_bytes"),
            py::call_guard<py::gil_scoped_release>())
       .def("done", &RowReader::done, py::arg("ticket"))
@@ -522,5 +539,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("file_sizes", &RowReader::file_sizes)
       .def("o_direct", &RowReader::o_direct)
       .def("num_threads", &RowReader::num_threads)
+      .def("set_gather_willneed", &RowReader::set_gather_willneed, py::arg("on"))
+      .def("gather_willneed", &RowReader::gather_willneed)
       .def("shutdown", &RowReader::shutdown, py::call_guard<py::gil_scoped_release>());
 }

@@ -271,7 +271,9 @@ def test_pp_schema_sender_equals_receiver(ds41_text_config, partition: list[int]
     payload = sum(torch.Size(shape).numel() * dtype.itemsize
                   for shape, dtype in DeepseekV41Model.pp_static_schema(stages[-1], 1).values())
     # §3.5 bytes/token; the mirror check adds 4 B/token (kv20_crc int32) on the kv-source-20 boundary only
-    assert payload == (50448 + 4 * crc_check if len(partition) == 3 else 40976)
+    # §3.5 bytes/token: hidden 40960 + pre_mix 16 (+ kv20: packed ckv 288 + ik 256 + cand 8192 = 8736 on the source-20 boundary;
+    # the FP16 ckv record was 1024 -> 50448)
+    assert payload == (49712 + 4 * crc_check if len(partition) == 3 else 40976)
     assert (KV20_CRC_KEY in DeepseekV41Model.pp_static_schema(stages[-1], 1)) == (crc_check and len(partition) == 3)
 
 
@@ -280,7 +282,9 @@ def _pp_fake(stage_kwargs: dict, **attrs):
 
     fake = SimpleNamespace(stage=SimpleNamespace(**stage_kwargs), pp_is_first=False, pp_is_last=False, layers=[],
                            start_layer=0, end_layer=0, **attrs)
-    fake.forward = functools.partial(DeepseekV41Model.forward, fake)
+    for name in ("forward", "_embed_or_ingest", "_run_layers", "_export"):
+        setattr(fake, name, functools.partial(getattr(DeepseekV41Model, name), fake))
+    fake._aux_layers = ()
     return fake
 
 
@@ -291,7 +295,7 @@ def test_kv20_crc_travels_exporter_to_mirror(crc_check: bool) -> None:
     from vllm.models.deepseek_v41.sm70.model import KV20_CRC_KEY
 
     T, gen = 3, torch.Generator().manual_seed(7)
-    shared = SimpleNamespace(export_ckv=torch.randn(8, C.CKV_RECORD_DIM, generator=gen).half(),
+    shared = SimpleNamespace(export_ckv=torch.randint(0, 256, (8, C.CKV_PACKED_DIM), generator=gen, dtype=torch.uint8),
                              export_ik=torch.randn(8, C.IK_RECORD_DIM, generator=gen).half(),
                              candidate_blocks=torch.randint(0, 9, (8, C.CAND_TOPK_BLOCKS), dtype=torch.int32))
     exporter = _pp_fake(dict(exports_kv_sources=(C.CAND_SOURCE,), mirrored_kv_sources=()), shared=shared,
@@ -306,7 +310,7 @@ def test_kv20_crc_travels_exporter_to_mirror(crc_check: bool) -> None:
                         kv20_crc_check=crc_check)
     receiver.forward(None, torch.arange(T), out)
     if crc_check:
-        want = (shared.export_ckv[:T].view(torch.int16).sum(-1, dtype=torch.int32)
+        want = (shared.export_ckv[:T].to(torch.int32).sum(-1, dtype=torch.int32)
                 + shared.export_ik[:T].view(torch.int16).sum(-1, dtype=torch.int32))
         assert out.tensors[KV20_CRC_KEY].dtype == torch.int32 and out.tensors[KV20_CRC_KEY].shape == (T,)
         assert torch.equal(mirror.crcs[-1], want)

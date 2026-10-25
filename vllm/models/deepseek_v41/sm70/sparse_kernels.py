@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gather kernels over FP16 KV records (PORT_DESIGN §1 "Sparse attention kernel" row; owner L-ATTN).
+"""Gather kernels over the KV records (PORT_DESIGN §1 "Sparse attention kernel" row; owner L-ATTN).
+
+Window rows are FP16; compressed rows are packed FP4 records (``qat.unpack_ckv``) and are unpacked to the same
+FP16 values right after the gather, so the attention math below is unchanged.
 
 Per query token t the reference (ref:k.py:310-403) attends over at most 128 window rows plus at most 512
 compressed rows (indices -1 = invalid), with a per-head ``attn_sink`` logit in the denominator only:
@@ -20,13 +23,150 @@ Two implementations over the same gathered rows (query-tiled so the gather works
 
 from __future__ import annotations
 
+import os
+
 import torch
 
+from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common import qat
 from vllm.models.deepseek_v41.common.rope import apply_rope_torch
 from vllm.triton_utils import tl, triton
 
 RUNNING_MAX_FLOOR = -1e30
+FUSED_DECODE = knobs.env_bool("VLLM_DS41_ATTN_FUSED_DECODE", False)   # fused_decode_attention for small T (sm70 impl)
+# Per-layer CUDA graphs of the decode attention break: the metadata builders fill static buffers, every
+# compressed group has exactly T latents (slot -1 = not stored), the compressor/indexer take no host decisions, and
+# attention.py captures the per-layer segments as CUDA graphs keyed by (T, buffer addresses).
+ATTN_GRAPH = knobs.env_bool("VLLM_DS41_ATTN_GRAPH", False)
+# With ATTN_GRAPH: layers whose attention takes no host decision (no indexer scan) are captured INSIDE the outer breakable
+# CUDA graph instead of being eager breaks; the runner then builds (dummy) attention metadata at capture time so the
+# captured kernels bind to the builders' static buffers. Indexer layers (2/8/14/20 full scan, 24-36 regime-dependent) and
+# Engram stay eager breaks.
+ATTN_OUTER_GRAPH = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_ATTN_OUTER_GRAPH", False)
+# Metadata builders replay their kernels (token meta, window rows, compressed slots/meta, state rows) from one CUDA graph
+# per builder and batch shape instead of ~90 Triton launches per decode step (each ~40 us of Python launch overhead).
+BUILDER_GRAPHS = ATTN_GRAPH and knobs.env_bool("VLLM_DS41_BUILDER_GRAPHS", False)
+_GRAPH_STREAM: list = []
+
+
+def capture_graph(fn, pool) -> torch.cuda.CUDAGraph:
+    """Capture ``fn`` on a side stream (ordered after the current stream's work; the current stream waits for the
+    capture); the caller replays. No sync / gc / empty_cache."""
+    if not _GRAPH_STREAM:
+        _GRAPH_STREAM.append(torch.cuda.Stream())
+    side = _GRAPH_STREAM[0]
+    cur = torch.cuda.current_stream()
+    side.wait_stream(cur)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        g.capture_begin(pool=pool, capture_error_mode="thread_local")
+        try:
+            fn()
+        finally:
+            g.capture_end()
+    cur.wait_stream(side)
+    return g
+
+
+# ----------------------------------------------------------------------------- metadata builders (graph mode)
+@triton.jit
+def _rows_kernel(pos_ptr, slot_ptr, tok2req_ptr, bt_ptr, bt_stride, out_ptr, bs, K: tl.constexpr, MODE: tl.constexpr):
+    """Rows of K positions per token through the token's block table. MODE 0: positions p-(K-1)..p (window), valid
+    when the token is real (slot >= 0) and the position >= 0. MODE 1 (K = 1): position p-1 when p completes a pair."""
+    t = tl.program_id(0).to(tl.int64)
+    p = tl.load(pos_ptr + t)
+    real = tl.load(slot_ptr + t) >= 0
+    j = tl.arange(0, K)
+    if MODE == 0:
+        q = p - (K - 1) + j
+        valid = (q >= 0) & real
+    else:
+        q = p - 1 + j * 0
+        valid = (q >= 0) & real & (((p + 1) % 2) == 0)
+    req = tl.load(tok2req_ptr + t).to(tl.int64)
+    qq = tl.where(valid, q, 0)
+    blk = tl.load(bt_ptr + req * bt_stride + qq // bs).to(tl.int64)
+    tl.store(out_ptr + t * K + j, tl.where(valid, blk * bs + qq % bs, -1))
+
+
+def rows_of_positions_kernel(positions: torch.Tensor, slot_mapping: torch.Tensor, tok2req: torch.Tensor,
+                             block_table: torch.Tensor, block_size: int, out: torch.Tensor, mode: int) -> None:
+    """out [T, K] int64 (K = 128 window rows, or 1 for the state's previous row)."""
+    T, K = out.shape
+    if T == 0:
+        return
+    if block_table.stride(1) != 1 or block_table.dtype != torch.int32:
+        raise ValueError("rows_of_positions_kernel: block table must be a row-major int32 tensor")
+    _rows_kernel[(T,)](positions, slot_mapping, tok2req, block_table, block_table.stride(0), out, block_size,
+                       K=K, MODE=mode, num_warps=1)
+
+
+@triton.jit
+def _cmeta_kernel(pos_ptr, slot_ptr, cslot_ptr, nvis_ptr, lpos_ptr, lslot_ptr, T, r, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < T
+    p = tl.load(pos_ptr + i, mask=m, other=0)
+    real = tl.load(slot_ptr + i, mask=m, other=-1) >= 0
+    cs = tl.load(cslot_ptr + i, mask=m, other=-1)
+    tl.store(nvis_ptr + i, tl.where(real, (p + 1) // r, 0), mask=m)
+    completes = (((p + 1) % r) == 0) & real
+    tl.store(lpos_ptr + i, tl.maximum(p - (r - 1), 0), mask=m)
+    tl.store(lslot_ptr + i, tl.where(completes, cs, -1), mask=m)
+
+
+def compressed_meta_kernel(positions: torch.Tensor, slot_mapping: torch.Tensor, cslots: torch.Tensor, ratio: int,
+                           num_visible: torch.Tensor, latent_pos: torch.Tensor, latent_slots: torch.Tensor) -> None:
+    """Graph-mode compressed metadata for T tokens: num_visible, latent_pos (clamped), latent_slots (-1 = no store)."""
+    T = positions.shape[0]
+    if T == 0:
+        return
+    BLOCK = 256
+    _cmeta_kernel[(triton.cdiv(T, BLOCK),)](positions, slot_mapping, cslots, num_visible, latent_pos, latent_slots, T,
+                                            ratio, BLOCK=BLOCK, num_warps=4)
+
+
+@triton.jit
+def _tok_meta_kernel(qsl_ptr, seq_ptr, tok2req_ptr, pos_ptr, BLOCK: tl.constexpr):
+    """Per request r: tokens qsl[r]..qsl[r+1]-1 get tok2req = r and positions = seq_lens[r] - qsl[r+1] + t."""
+    r = tl.program_id(0)
+    a = tl.load(qsl_ptr + r)
+    b = tl.load(qsl_ptr + r + 1)
+    seq = tl.load(seq_ptr + r).to(tl.int64)
+    for t0 in range(a, b, BLOCK):
+        t = t0 + tl.arange(0, BLOCK)
+        m = t < b
+        tl.store(tok2req_ptr + t, tl.full((BLOCK,), 0, tl.int32) + r, mask=m)
+        tl.store(pos_ptr + t, seq - b.to(tl.int64) + t.to(tl.int64), mask=m)
+
+
+def token_meta_kernel(query_start_loc: torch.Tensor, seq_lens: torch.Tensor, num_reqs: int, tok2req: torch.Tensor,
+                      positions: torch.Tensor) -> None:
+    """Device-side token -> request ids (int32) and positions (int64) from the runner's persistent query_start_loc /
+    seq_lens: no host->device copy, no synchronous pageable memcpy per builder per step."""
+    if num_reqs == 0:
+        return
+    _tok_meta_kernel[(num_reqs,)](query_start_loc, seq_lens, tok2req, positions, BLOCK=256, num_warps=4)
+
+
+# ----------------------------------------------------------------------------- compressor state rows
+@triton.jit
+def _state_store_kernel(src_ptr, src_st, slot_ptr, rows_ptr, D: tl.constexpr):
+    n = tl.program_id(0)
+    slot = tl.load(slot_ptr + n).to(tl.int64)
+    if slot >= 0:
+        d = tl.arange(0, D)
+        v = tl.load(src_ptr + n.to(tl.int64) * src_st + d)
+        tl.store(rows_ptr + slot * D + d, v)
+
+
+def state_rows_store(src: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
+    """rows[slots[t]] = src[t] for slots[t] >= 0 (no host sync; the eager path's ``index_copy_(slots[keep])``)."""
+    T, D = src.shape
+    if T == 0:
+        return
+    if rows.shape[-1] != D or src.dtype != rows.dtype or src.stride(-1) != 1:
+        raise ValueError(f"state_rows_store: src {tuple(src.shape)} {src.dtype} vs rows {tuple(rows.shape)} {rows.dtype}")
+    _state_store_kernel[(T,)](src, src.stride(0), slots, rows, D=D, num_warps=4)
 
 
 # ----------------------------------------------------------------------------- compressed-KV store
@@ -46,26 +186,35 @@ def _ckv_store_kernel(lat_ptr, lat_st, pos_ptr, cs_ptr, rows_ptr, slot_ptr, exp_
     re = tl.where(rot, e * c - o * s, e)
     ro = tl.where(rot, e * s + o * c, o)
     x = tl.reshape(tl.join(re, ro), (1, D // 16, 16))
-    y = tl.reshape(qat.fp4_e4m3_qdq_tile(x, 16), (D,)).to(rows_ptr.dtype.element_ty)
-    d = tl.arange(0, D)
-    slot = tl.load(slot_ptr + n)
+    codes, sbytes = qat.fp4_e4m3_quant_tile(x, 16)
+    lo, hi = tl.split(tl.reshape(codes, (D // 2, 2)))                 # dims 2i (low nibble), 2i + 1 (high)
+    nib = (lo | (hi << 4)).to(tl.uint8)
+    sb = tl.reshape(sbytes, (D // 16,)).to(tl.uint8)
+    j = tl.arange(0, D // 16)
+    PACKED: tl.constexpr = D // 2 + D // 16
+    slot = tl.load(slot_ptr + n).to(tl.int64)
     if slot >= 0:
-        tl.store(rows_ptr + slot * D + d, y)
+        tl.store(rows_ptr + slot * PACKED + i, nib)
+        tl.store(rows_ptr + slot * PACKED + D // 2 + j, sb)
     if EXPORT:
-        tl.store(exp_ptr + n.to(tl.int64) * D + d, y)
+        tl.store(exp_ptr + n.to(tl.int64) * PACKED + i, nib)
+        tl.store(exp_ptr + n.to(tl.int64) * PACKED + D // 2 + j, sb)
 
 
 def ckv_rope_qat_store(latent: torch.Tensor, latent_pos: torch.Tensor, cos_sin_cache: torch.Tensor,
                        rows: torch.Tensor, slots: torch.Tensor, export: torch.Tensor | None,
                        impl: str = "sm70") -> None:
     """Compressed-KV write (ref:m.py:751-761): RoPE on the last 64 dims at the group's first position,
-    E2M1 x E4M3/16 QAT, FP16 rows at ``slots`` [N] (-1: skip); ``export`` [N, 512] receives the same records."""
+    E2M1 x E4M3/16 QAT, packed FP4 records (uint8 [*, 288]) at ``slots`` [N] (-1: skip); ``export`` [N, 288]
+    receives the same records."""
     N, D = latent.shape
     if N == 0:
         return
+    if rows.dtype != torch.uint8 or rows.shape[-1] != D // 2 + D // 16:
+        raise TypeError(f"ckv_rope_qat_store: rows must be packed uint8 [*, {D // 2 + D // 16}], got {rows.dtype} "
+                        f"{tuple(rows.shape)}")
     if impl == "torch":
-        rec = qat.fp4_e4m3_qdq(apply_rope_torch(latent.float(), latent_pos, cos_sin_cache), out_dtype=rows.dtype,
-                               impl="torch")
+        rec = qat.fp4_e4m3_pack_torch(apply_rope_torch(latent.float(), latent_pos, cos_sin_cache))
         keep = slots >= 0
         rows.index_copy_(0, slots[keep], rec[keep])
         if export is not None:
@@ -79,10 +228,32 @@ def ckv_rope_qat_store(latent: torch.Tensor, latent_pos: torch.Tensor, cos_sin_c
 
 
 # ----------------------------------------------------------------------------- index -> row translation
+@triton.jit
+def _logical_to_rows_kernel(idx_ptr, tok2req_ptr, bt_ptr, bt_stride, out_ptr, K, storage, BLOCK: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    req = tl.load(tok2req_ptr + t).to(tl.int64)
+    for k0 in range(0, K, BLOCK):
+        k = k0 + tl.arange(0, BLOCK)
+        m = k < K
+        j = tl.load(idx_ptr + t * K + k, mask=m, other=-1).to(tl.int64)
+        valid = j >= 0
+        jj = tl.where(valid, j, 0)
+        blk = tl.load(bt_ptr + req * bt_stride + jj // storage, mask=m, other=0).to(tl.int64)
+        tl.store(out_ptr + t * K + k, tl.where(valid, blk * storage + jj % storage, -1), mask=m)
+
+
 def logical_to_rows(idx: torch.Tensor, tok2req: torch.Tensor, block_table: torch.Tensor,
                     storage_block_size: int) -> torch.Tensor:
     """Compressed logical positions idx [T, K] (-1 pad) of each token's request -> cache rows [T, K] int64
-    through the SOURCE layer's block table (row = block * storage + j % storage)."""
+    through the SOURCE layer's block table (row = block * storage + j % storage). Graph mode: one kernel (the torch
+    formulation below is ~9 launches); same integer math, identical results."""
+    if ATTN_GRAPH and idx.is_cuda and idx.dim() == 2 and block_table.stride(1) == 1 and idx.shape[0] > 0:
+        T, K = idx.shape
+        out = torch.empty((T, K), dtype=torch.int64, device=idx.device)
+        if K > 0:
+            _logical_to_rows_kernel[(T,)](idx.contiguous(), tok2req, block_table, block_table.stride(0), out, K,
+                                          storage_block_size, BLOCK=min(1024, triton.next_power_of_2(K)), num_warps=4)
+        return out
     valid = idx >= 0
     j = idx.clamp(min=0).to(torch.int64)
     blk = block_table[tok2req.to(torch.long)[:, None].expand_as(j), j // storage_block_size].to(torch.int64)
@@ -90,12 +261,88 @@ def logical_to_rows(idx: torch.Tensor, tok2req: torch.Tensor, block_table: torch
 
 
 # ----------------------------------------------------------------------------- attention
-def _gather(rows: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """rows [N, D], idx [Q, K] int64 (-1 allowed) -> [Q, K, D]; invalid entries are ZERO rows (the reference
-    loads 0 for idx == -1): masking the score alone is not enough, since 0 * (inf or NaN garbage) in the PV
-    product is NaN."""
-    g = rows.index_select(0, idx.clamp(min=0).reshape(-1)).view(*idx.shape, rows.shape[-1])
+def _gather(rows: torch.Tensor, idx: torch.Tensor, impl: str = "sm70") -> torch.Tensor:
+    """rows [N, D] fp16 or packed FP4 [N, 288] uint8, idx [Q, K] int64 (-1 allowed) -> [Q, K, D] fp16; invalid
+    entries are ZERO rows (the reference loads 0 for idx == -1): masking the score alone is not enough, since
+    0 * (inf or NaN garbage) in the PV product is NaN."""
+    g = rows.index_select(0, idx.clamp(min=0).reshape(-1))
+    if rows.dtype == torch.uint8:
+        g = qat.unpack_ckv(g, impl="torch" if impl == "torch" else None)
+    g = g.view(*idx.shape, g.shape[-1])
     return g.masked_fill_((idx < 0)[..., None], 0)
+
+
+# ----------------------------------------------------------------------------- direct tile gather (GATHER_ONCE)
+# VLLM_DS41_ATTN_GATHER_ONCE=1: the prefill tile [Q, K_total, D] fp16 is written in ONE pass per source straight from
+# the caches by row id (window rows copied, packed FP4 rows unpacked in registers, -1 -> +0.0), instead of
+# index_select -> unpack -> masked_fill -> torch.cat (four materialisations, peak = sources + cat output). The tile holds
+# the same bits as the torch.cat it replaces (same unpack math as qat._unpack_ckv_kernel; masked loads give +0.0 as
+# masked_fill does), so the bmm / softmax that follow are unchanged. The per-group row ids are shared across the layers
+# of a (kv source, index source) group by attention.py (sm70/gather_once.py). 0 (default) = today's path byte for byte.
+GATHER_ONCE_ENV = "VLLM_DS41_ATTN_GATHER_ONCE"
+GATHER_ONCE = knobs.env_bool(GATHER_ONCE_ENV, False)
+GATHER_ONCE_MIN_T = 17          # decode / spec-verify shapes (and their CUDA graphs) keep today's path
+_GKB = 16                       # keys per program
+
+
+@triton.jit
+def _gather_tile_kernel(rows_ptr, idx_ptr, idx_stride, dst_ptr, dst_q_stride, k_off, K,
+                        D: tl.constexpr, KB: tl.constexpr, PACKED_SRC: tl.constexpr):
+    q = tl.program_id(0).to(tl.int64)
+    kk = tl.program_id(1) * KB + tl.arange(0, KB)
+    km = kk < K
+    row = tl.load(idx_ptr + q * idx_stride + kk, mask=km, other=-1)
+    valid = (row >= 0) & km
+    r = tl.where(valid, row, 0).to(tl.int64)
+    dst = dst_ptr + q * dst_q_stride + (k_off + kk).to(tl.int64)[:, None] * D
+    d = tl.arange(0, D)
+    if PACKED_SRC:
+        HALF: tl.constexpr = D // 2
+        PACKED: tl.constexpr = D // 2 + D // 16
+        i = tl.arange(0, HALF)
+        byte = tl.load(rows_ptr + r[:, None] * PACKED + i[None, :], mask=valid[:, None], other=0).to(tl.int32)
+        sb = tl.load(rows_ptr + r[:, None] * PACKED + HALF + (i[None, :] // 8), mask=valid[:, None], other=0)
+        sc = qat.e4m3_value(sb.to(tl.int32))
+        lo = qat.e2m1_value(byte & 0xF) * sc                     # = qat._unpack_ckv_kernel's lo * scale_pair
+        hi = qat.e2m1_value((byte >> 4) & 0xF) * sc
+        vals = tl.reshape(tl.join(lo, hi), (KB, D)).to(tl.float16)
+        vals = tl.where(valid[:, None], vals, 0.0)               # +0.0, as masked_fill_ (never trust 0 * scale)
+        tl.store(dst + d[None, :], vals, mask=km[:, None])
+    else:
+        v = tl.load(rows_ptr + r[:, None] * D + d[None, :], mask=valid[:, None], other=0.0)
+        tl.store(dst + d[None, :], v, mask=km[:, None])
+
+
+def gather_tile_ok(sources: list[tuple[torch.Tensor, torch.Tensor]], D: int) -> bool:
+    """The direct tile gather handles fp16 [*, D] and packed [*, 288] (D = 512) sources with D a power of two."""
+    if D & (D - 1):
+        return False
+    for rows, idx in sources:
+        if rows.stride(-1) != 1 or rows.stride(0) != rows.shape[-1] or idx.dtype != torch.int64:
+            return False
+        if not ((rows.dtype == torch.float16 and rows.shape[-1] == D) or
+                (rows.dtype == torch.uint8 and rows.shape[-1] == qat.CKV_PACKED_DIM and D == 512)):
+            return False
+    return True
+
+
+def gather_tile(sources: list[tuple[torch.Tensor, torch.Tensor]], t0: int, t1: int, D: int) -> torch.Tensor:
+    """[t1 - t0, sum K_i, D] fp16 == torch.cat([_gather(rows, idx[t0:t1]) ...], dim=1), written in place."""
+    Q = t1 - t0
+    ktot = sum(idx.shape[1] for _, idx in sources)
+    kv = torch.empty((Q, ktot, D), dtype=torch.float16, device=sources[0][0].device)
+    k_off = 0
+    for rows, idx in sources:
+        K = idx.shape[1]
+        it = idx[t0:t1]
+        if it.stride(-1) != 1:
+            it = it.contiguous()
+        if Q and K:
+            _gather_tile_kernel[(Q, triton.cdiv(K, _GKB))](
+                rows, it, it.stride(0), kv, ktot * D, k_off, K, D=D, KB=_GKB,
+                PACKED_SRC=rows.dtype == torch.uint8, num_warps=4)
+        k_off += K
+    return kv
 
 
 def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor,
@@ -108,12 +355,25 @@ def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Te
     if out.shape != q.shape:
         raise ValueError(f"out {tuple(out.shape)} != q {tuple(q.shape)}")
     for rows, idx in sources:
-        if rows.dtype != torch.float16 or rows.shape[-1] != D or idx.shape[0] != T:
+        fp16 = rows.dtype == torch.float16 and rows.shape[-1] == D
+        packed = rows.dtype == torch.uint8 and rows.shape[-1] == qat.CKV_PACKED_DIM and D == 512
+        if not (fp16 or packed) or idx.shape[0] != T:
             raise ValueError(f"bad source rows {tuple(rows.shape)} {rows.dtype} idx {tuple(idx.shape)}")
     sinkf = sink.float()[:H]
+    if impl == "sm70" and FUSED_DECODE and T <= FUSED_DECODE_MAX_T and D == 512:
+        fused_decode_attention(q, sources, sinkf, scale, out)
+        return
+    if (impl == "sm70" and FUSED_PREFILL and T >= FUSED_PREFILL_MIN_T and fused_prefill_ok(q, sources, out)
+            and not torch.cuda.is_current_stream_capturing()):
+        fused_prefill_attention(q, sources, sinkf, scale, out)
+        return
+    direct = GATHER_ONCE and impl == "sm70" and T >= GATHER_ONCE_MIN_T and gather_tile_ok(sources, D)
     for t0 in range(0, T, tile):
         t1 = min(T, t0 + tile)
-        kv = torch.cat([_gather(rows, idx[t0:t1]) for rows, idx in sources], dim=1)       # [Q, K, D] fp16
+        if direct:
+            kv = gather_tile(sources, t0, t1, D)                                          # same bits, one pass
+        else:
+            kv = torch.cat([_gather(rows, idx[t0:t1], impl) for rows, idx in sources], dim=1)  # [Q, K, D] fp16
         valid = torch.cat([idx[t0:t1] >= 0 for _, idx in sources], dim=1)                # [Q, K]
         qt = q[t0:t1]
         if impl == "torch":
@@ -132,3 +392,252 @@ def sparse_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Te
         else:
             o = torch.bmm(p.to(torch.float16), kv, out_dtype=torch.float32)
         out[t0:t1] = (o / denom[..., None]).to(out.dtype)
+
+
+# ----------------------------------------------------------------------------- fused decode attention
+# Split-K decode attention in two launches. Kernel 1: one program per (query token, 16-key block) gathers its rows
+# once -- window rows from the FP16 cache, compressed rows from the packed FP4 cache (unpacked in registers) -- and
+# computes, for every head, the block's softmax partials (max, sum, P.V accumulator). Kernel 2: one program per
+# (token, head) merges the partials in fixed order, adds the attention sink and normalises. Replaces the ~18 eager
+# launches of the tiled torch path per layer per decode step. Dims are handled as (even, odd) halves so a packed
+# nibble byte maps onto one (even, odd) pair; q and the output are split / merged the same way.
+# Numerics: FP32 throughout (the sm70 bmm path rounds p to FP16); within FP32 ulps of the torch oracle, not
+# bit-identical. Gated by tolerance tests and the KL panel.
+
+FUSED_DECODE_ENV = "VLLM_DS41_ATTN_FUSED_DECODE"
+FUSED_DECODE_MAX_T = 16
+_KB = 16            # keys per block
+
+
+@triton.jit
+def _fused_attn_partial_kernel(q_ptr, part_ml_ptr, part_acc_ptr, scale, swa_ptr, widx_ptr, ckv_ptr, cidx_ptr,
+                               x_ptr, xidx_ptr,
+                               H: tl.constexpr, D: tl.constexpr, NW: tl.constexpr, NC: tl.constexpr,
+                               NX: tl.constexpr, KB: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+    NSPLIT: tl.constexpr = (NW + NC + NX) // KB
+    HALF: tl.constexpr = D // 2
+    PACKED: tl.constexpr = D // 2 + D // 16
+    i = tl.arange(0, HALF)
+    kk = tl.arange(0, KB)
+    if blk * KB < NW:                                        # window block: fp16 rows
+        row = tl.load(widx_ptr + t * NW + blk * KB + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        k_e = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        k_o = tl.load(swa_ptr + r[:, None] * D + 2 * i[None, :] + 1, mask=valid[:, None], other=0.0).to(tl.float32)
+    elif blk * KB < NW + NC:                                 # compressed block: packed FP4 rows
+        row = tl.load(cidx_ptr + t * NC + (blk * KB - NW) + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        byte = tl.load(ckv_ptr + r[:, None] * PACKED + i[None, :], mask=valid[:, None], other=0).to(tl.int32)
+        sb = tl.load(ckv_ptr + r[:, None] * PACKED + HALF + (i[None, :] // 8), mask=valid[:, None], other=0)
+        sc = qat.e4m3_value(sb.to(tl.int32))
+        k_e = qat.e2m1_value(byte & 0xF) * sc
+        k_o = qat.e2m1_value((byte >> 4) & 0xF) * sc
+    else:                                                    # extra fp16 rows (e.g. the DSpark block K/V)
+        row = tl.load(xidx_ptr + t * NX + (blk * KB - NW - NC) + kk)
+        valid = row >= 0
+        r = tl.where(valid, row, 0).to(tl.int64)
+        k_e = tl.load(x_ptr + r[:, None] * D + 2 * i[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        k_o = tl.load(x_ptr + r[:, None] * D + 2 * i[None, :] + 1, mask=valid[:, None], other=0.0).to(tl.float32)
+    for h in tl.static_range(H):
+        qbase = q_ptr + (t * H + h) * D
+        q_e = tl.load(qbase + 2 * i).to(tl.float32) * scale
+        q_o = tl.load(qbase + 2 * i + 1).to(tl.float32) * scale
+        s = tl.sum(k_e * q_e[None, :], axis=1) + tl.sum(k_o * q_o[None, :], axis=1)      # [KB]
+        s = tl.where(valid, s, float("-inf"))
+        m = tl.maximum(tl.max(s, axis=0), -1e30)             # RUNNING_MAX_FLOOR: an all-invalid block gives p = 0
+        p = tl.exp(s - m)
+        l = tl.sum(p, axis=0)
+        pidx = (t * NSPLIT + blk) * H + h
+        tl.store(part_ml_ptr + pidx * 2, m)
+        tl.store(part_ml_ptr + pidx * 2 + 1, l)
+        tl.store(part_acc_ptr + pidx * D + i, tl.sum(p[:, None] * k_e, axis=0))
+        tl.store(part_acc_ptr + pidx * D + HALF + i, tl.sum(p[:, None] * k_o, axis=0))
+
+
+@triton.jit
+def _fused_attn_merge_kernel(part_ml_ptr, part_acc_ptr, sink_ptr, out_ptr, H: tl.constexpr, D: tl.constexpr,
+                             NSPLIT: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    HALF: tl.constexpr = D // 2
+    i = tl.arange(0, HALF)
+    m = tl.full((), -1e30, tl.float32)
+    for s in tl.static_range(NSPLIT):
+        m = tl.maximum(m, tl.load(part_ml_ptr + ((t * NSPLIT + s) * H + h) * 2))
+    l = tl.zeros((), dtype=tl.float32)
+    acc_e = tl.zeros((HALF,), dtype=tl.float32)
+    acc_o = tl.zeros((HALF,), dtype=tl.float32)
+    for s in tl.static_range(NSPLIT):
+        pidx = (t * NSPLIT + s) * H + h
+        alpha = tl.exp(tl.load(part_ml_ptr + pidx * 2) - m)
+        l += tl.load(part_ml_ptr + pidx * 2 + 1) * alpha
+        acc_e += tl.load(part_acc_ptr + pidx * D + i) * alpha
+        acc_o += tl.load(part_acc_ptr + pidx * D + HALF + i) * alpha
+    l = l + tl.exp(tl.load(sink_ptr + h) - m)
+    obase = out_ptr + (t * H + h) * D
+    tl.store(obase + 2 * i, (acc_e / l).to(tl.float16))
+    tl.store(obase + 2 * i + 1, (acc_o / l).to(tl.float16))
+
+
+_WS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _workspace(device: torch.device, T: int, nsplit: int, H: int, D: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-shape partial buffers, allocated once (attention runs outside the CUDA graphs: every allocation is a launch)."""
+    key = (str(device), T, nsplit, H, D)
+    ws = _WS.get(key)
+    if ws is None:
+        ws = (torch.empty((T, nsplit, H, 2), dtype=torch.float32, device=device),
+              torch.empty((T, nsplit, H, D), dtype=torch.float32, device=device))
+        _WS[key] = ws
+    return ws
+
+
+def fused_decode_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor,
+                           scale: float, out: torch.Tensor) -> None:
+    """Decode-step sparse attention in two launches. ``sources`` = [(swa_rows fp16 [*, D], win_idx [T, 128]),
+    optionally (ckv_rows packed uint8 [*, 288], ckv_idx [T, 512])]; idx -1 = invalid."""
+    T, H, D = q.shape
+    (swa_rows, widx), *rest = sources
+    if swa_rows.dtype != torch.float16 or swa_rows.shape[-1] != D:
+        raise ValueError("fused_decode_attention: window rows must be fp16 [*, D]")
+    widx = widx.contiguous()
+    NW = widx.shape[1]
+    ckv_rows, cidx, NC = swa_rows, widx, 0           # unused unless given: no block of theirs is ever selected
+    x_rows, xidx, NX = swa_rows, widx, 0
+    for rows, idx in rest:                            # at most one packed (compressed) and one extra fp16 source
+        if rows.dtype == torch.uint8:
+            if rows.shape[-1] != qat.CKV_PACKED_DIM or D != 512 or NC:
+                raise ValueError("fused_decode_attention: one packed uint8 [*, 288] source with D = 512")
+            ckv_rows, cidx, NC = rows, idx.contiguous(), idx.shape[1]
+        elif rows.dtype == torch.float16 and rows.shape[-1] == D and not NX:
+            x_rows, xidx, NX = rows, idx.contiguous(), idx.shape[1]
+        else:
+            raise ValueError(f"fused_decode_attention: unsupported source {rows.dtype} {tuple(rows.shape)}")
+    if NW % _KB or NC % _KB or NX % _KB:
+        raise ValueError(f"fused_decode_attention: key counts must be multiples of {_KB}")
+    if widx.dtype != torch.int64 or cidx.dtype != torch.int64 or xidx.dtype != torch.int64:
+        raise TypeError("fused_decode_attention: index tensors must be int64 (as built by the metadata)")
+    nsplit = (NW + NC + NX) // _KB
+    part_ml, part_acc = _workspace(q.device, T, nsplit, H, D)
+    _fused_attn_partial_kernel[(T, nsplit)](
+        q.contiguous(), part_ml, part_acc, float(scale), swa_rows, widx, ckv_rows, cidx, x_rows, xidx,
+        H=H, D=D, NW=NW, NC=NC, NX=NX, KB=_KB, num_warps=4)
+    _fused_attn_merge_kernel[(T, H)](part_ml, part_acc, sink.float().contiguous(), out, H=H, D=D, NSPLIT=nsplit,
+                                     num_warps=2)
+
+
+# ----------------------------------------------------------------------------- fused prefill attention (CUDA, sm_70)
+# VLLM_DS41_ATTN_FUSED_PREFILL=1: prefill / chunked-prefill steps (T >= 17) run one CUDA kernel per layer
+# (csrc/ds41_sparse_prefill_sm70.cu) instead of the per-tile gather -> [Q, 640, 512] fp16 -> QK bmm -> torch softmax
+# -> PV bmm. One CTA per (query, 16-head group); K/V rows are read by row id straight from the caches (window fp16,
+# packed FP4 unpacked in registers with the qat math, -1 -> +0.0 row / -inf score), each 32-key block is staged once in
+# shared memory and used by all 16 heads (MQA), QK and PV on the tensor cores (WMMA = HMMA.884) with FP32 accumulate,
+# FP32 online softmax with the -1e30 running-max floor and the sink in the denominator. Nothing is materialised: no
+# workspace at all (the 160 MiB gather tile and the [Q, H, 640] fp32 scores disappear).
+# Numerics: not bit-identical to the bmm path (FP32 summation order). P enters PV as fp16 hi + fp16 lo
+# (VLLM_DS41_ATTN_FUSED_PREFILL_PSPLIT=1, default), so P keeps ~22 bits where the bmm path rounds it to fp16 once.
+# Tolerance class of FUSED_DECODE; gate with tests/models/deepseek_v41/test_attn_fused_prefill.py and the KL panel.
+# Triton is not used: Triton's fp16 tl.dot miscompiles silently on SM70 (rows wrong, no error) and its fp32 dot is FMA.
+# The extension is PREBUILT (scripts/build_ds41_sparse_prefill.py); workers never compile it. Knob on + missing .so
+# raises at the first call instead of silently measuring the old path.
+
+FUSED_PREFILL_ENV = "VLLM_DS41_ATTN_FUSED_PREFILL"
+FUSED_PREFILL = knobs.env_bool(FUSED_PREFILL_ENV, False)
+FUSED_PREFILL_PSPLIT = knobs.env_bool("VLLM_DS41_ATTN_FUSED_PREFILL_PSPLIT", True)
+FUSED_PREFILL_MIN_T = 17        # decode / spec-verify shapes keep today's path (and FUSED_DECODE)
+FUSED_PREFILL_SO_ENV = "VLLM_DS41_SPARSE_PREFILL_SO"
+FUSED_PREFILL_SO_DEFAULT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))), "ds41_sparse_prefill.so")
+_PREFILL_EXT: list = []
+
+
+def load_prefill_ext():
+    """The prebuilt ds41_sparse_prefill extension (import by path, as ds41_vmm)."""
+    if _PREFILL_EXT:
+        return _PREFILL_EXT[0]
+    import importlib.util
+    import os
+    path = os.environ.get(FUSED_PREFILL_SO_ENV, FUSED_PREFILL_SO_DEFAULT)
+    if not os.path.isfile(path):
+        raise ImportError(f"{FUSED_PREFILL_ENV}=1 but the extension is not built at {path} "
+                          f"(run scripts/build_ds41_sparse_prefill.py, or set {FUSED_PREFILL_SO_ENV})")
+    spec = importlib.util.spec_from_file_location("ds41_sparse_prefill", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _PREFILL_EXT.append(mod)
+    return mod
+
+
+def fused_prefill_ok(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], out: torch.Tensor) -> bool:
+    """Shapes the kernel handles: D = 512, H % 16 == 0, sources = [(fp16 window rows, ids)] + optionally one packed
+    [*, 288] source, int64 ids. Anything else (e.g. an extra fp16 source) keeps the tiled path."""
+    T, H, D = q.shape
+    if D != 512 or H % 16 or not q.is_cuda or not 1 <= len(sources) <= 2:
+        return False
+    (swa, widx), *rest = sources
+    if swa.dtype != torch.float16 or swa.shape[-1] != D or widx.dtype != torch.int64:
+        return False
+    if rest:
+        ckv, cidx = rest[0]
+        if ckv.dtype != torch.uint8 or ckv.shape[-1] != qat.CKV_PACKED_DIM or cidx.dtype != torch.int64:
+            return False
+    return True
+
+
+def fused_prefill_attention(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor,
+                            scale: float, out: torch.Tensor, p_split: bool | None = None) -> None:
+    """One launch per layer. ``sources`` = [(swa_rows fp16 [N, 512], win_idx [T, NW] int64), optionally
+    (ckv_rows packed uint8 [M, 288], ckv_idx [T, NC] int64)]; ids -1 = invalid; sink fp32 [>= H]."""
+    ext = load_prefill_ext()
+    (swa, widx), *rest = sources
+    ckv, cidx = rest[0] if rest else (swa.new_empty((0, qat.CKV_PACKED_DIM), dtype=torch.uint8),
+                                      widx.new_empty((q.shape[0], 0)))
+    qc = q if (q.stride(-1) == 1 and q.stride(1) % 16 == 0 and q.stride(0) % 16 == 0
+               and q.data_ptr() % 32 == 0) else q.contiguous()
+    o = out if (out.stride(-1) == 1 and out.stride(1) % 8 == 0 and out.stride(0) % 8 == 0
+                and out.data_ptr() % 16 == 0) else torch.empty_like(q)
+    widx = widx if widx.stride(-1) == 1 else widx.contiguous()
+    cidx = cidx if cidx.stride(-1) == 1 else cidx.contiguous()
+    ext.fwd(qc, swa.contiguous(), widx, ckv.contiguous(), cidx, sink.float().contiguous(), float(scale), o,
+            FUSED_PREFILL_PSPLIT if p_split is None else bool(p_split))
+    if o is not out:
+        out.copy_(o)
+
+
+def fused_prefill_emulate(q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor,
+                          scale: float, p_split: bool = True, block: int = 32) -> torch.Tensor:
+    """Torch model of the kernel's algorithm (CPU-testable): 32-key blocks in source order, all-invalid blocks
+    skipped, FP32 online softmax floored at -1e30, P rounded to fp16 (hi [+ lo]) for PV, FP32 p in the
+    denominator, sink at the end. Same math as the CUDA kernel up to FP32 summation order inside the dots."""
+    T, H, D = q.shape
+    qf = q.float()
+    m = torch.full((T, H), RUNNING_MAX_FLOOR, dtype=torch.float32, device=q.device)
+    l = torch.zeros((T, H), dtype=torch.float32, device=q.device)
+    acc = torch.zeros((T, H, D), dtype=torch.float32, device=q.device)
+    for rows, idx in sources:
+        for k0 in range(0, idx.shape[1], block):
+            ids = idx[:, k0:k0 + block]
+            kv = _gather(rows, ids, "torch").float()                                   # [T, B, D], invalid -> 0
+            valid = ids >= 0
+            live = valid.any(dim=1)                                                    # per query: skip empty blocks
+            s = torch.einsum("thd,tbd->thb", qf, kv) * scale
+            s = s.masked_fill(~valid[:, None, :], float("-inf"))
+            m_new = torch.maximum(m, s.amax(dim=-1))
+            p = torch.exp(s - m_new[..., None])
+            alpha = torch.exp(m - m_new)
+            ph = p.half().float()
+            pq = ph + (p - ph).half().float() if p_split else ph
+            acc_new = acc * alpha[..., None] + torch.einsum("thb,tbd->thd", pq, kv)
+            l_new = l * alpha + p.sum(dim=-1)
+            sel = live[:, None]
+            m, l = torch.where(sel, m_new, m), torch.where(sel, l_new, l)
+            acc = torch.where(sel[..., None], acc_new, acc)
+    den = l + torch.exp(sink.float()[None, :H] - m)
+    return (acc / den[..., None]).to(torch.float16)

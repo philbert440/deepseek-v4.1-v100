@@ -978,6 +978,14 @@ class WorkerProc:
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
                 logger.exception("WorkerProc hit an exception.")
+                # DS41 (VLLM_DS41_WORKER_FAIL_FAST=1, default): a rank that throws inside execute_model leaves its
+                # TP/PP peers blocked in a collective. The engine then sat wedged ~10 min with /health 200
+                # (2026-10-22 23:40, 2026-10-23 21:16). Exit instead, so the executor's worker monitor shuts the
+                # engine down now.
+                if (method == "execute_model" or method == "sample_tokens") and os.environ.get(
+                        "VLLM_DS41_WORKER_FAIL_FAST", "1") == "1":
+                    logger.error("DS41: exiting worker after an execute_model exception (fail fast).")
+                    os._exit(1)
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
@@ -986,6 +994,22 @@ class WorkerProc:
 
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
+            # DS41 layer-sliced prefill: the last PP stage's slices of the step run here, after
+            # the step's output was sent (every rank of the stage: they hold TP collectives).
+            after = self._ds41_after_response
+            if after is None:
+                after = self._ds41_after_response = getattr(self.worker, "ds41_after_response", False)
+            if after:
+                try:
+                    after()
+                except Exception:
+                    logger.exception("WorkerProc hit an exception in ds41_after_response.")
+                    if os.environ.get("VLLM_DS41_WORKER_FAIL_FAST", "1") == "1":
+                        logger.error("DS41: exiting worker after a sliced-prefill exception (fail fast).")
+                        os._exit(1)
+                    raise
+
+    _ds41_after_response = None
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

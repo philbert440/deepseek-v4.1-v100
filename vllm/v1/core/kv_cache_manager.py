@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core import ds41_replay
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -17,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
+    SlidingWindowSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -169,6 +171,31 @@ class KVCacheManager:
             for group in kv_cache_config.kv_cache_groups
         )
 
+        # DeepSeek-V4.1 decoder replay (prefill row trim): K rows kept in the
+        # trimmed layers, 0 = off. See vllm/v1/core/ds41_replay.py.
+        self.replay_rows = 0
+        self.replay_window_groups: tuple[tuple[int, int, int], ...] = ()
+        self.num_replay_hit_shrinks = 0
+        if self.enable_caching and ds41_replay.is_ds41_kv_cache_config(kv_cache_config):
+            self.replay_rows = ds41_replay.read_replay_rows()
+            self.replay_window_groups = tuple(
+                (i, manager.block_size, manager.kv_cache_spec.sliding_window)
+                for i, manager in enumerate(self.coordinator.single_type_managers)
+                if isinstance(manager.kv_cache_spec, SlidingWindowSpec)
+            )
+            if self.replay_rows:
+                logger.info(
+                    "DS41 decoder replay: %s=%d, prefix hits above N - %d need an "
+                    "exact window (blocks deep from N - %d + %d) in %d sliding-window "
+                    "groups",
+                    ds41_replay.REPLAY_ROWS_ENV,
+                    self.replay_rows,
+                    self.replay_rows,
+                    self.replay_rows,
+                    ds41_replay.REPLAY_EXACT_MARGIN,
+                    len(self.replay_window_groups),
+                )
+
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
         # overhead.
@@ -217,6 +244,9 @@ class KVCacheManager:
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
         if not self.enable_caching or request.skip_reading_prefix_cache:
+            request.replay_exact_from = ds41_replay.replay_exact_from(
+                request.num_tokens, 0, self.replay_rows
+            )
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -231,6 +261,10 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if self.replay_rows:
+            computed_blocks, num_new_computed_tokens = self._validate_replay_hit(
+                request, computed_blocks, num_new_computed_tokens
+            )
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
@@ -245,6 +279,45 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _validate_replay_hit(
+        self,
+        request: Request,
+        computed_blocks: tuple[list[KVCacheBlock], ...],
+        num_hit_tokens: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """DeepSeek-V4.1 decoder replay: shrink a hit whose window is not exact.
+
+        A hit above ``N - K`` makes the kept rows read their trimmed-layer
+        window from the cache, so it is only valid if the window blocks are
+        deep; otherwise redo the lookup capped at ``N - K`` (the coordinator
+        aligns it for every KV cache group; any hit there is valid). Also
+        records where this pass's freshly computed KV becomes exact.
+        """
+        replay_start = request.num_tokens - self.replay_rows
+        if num_hit_tokens > replay_start and not ds41_replay.window_tail_is_deep(
+            computed_blocks, self.replay_window_groups, num_hit_tokens
+        ):
+            shrunk_from = num_hit_tokens
+            computed_blocks, num_hit_tokens = self.coordinator.find_longest_cache_hit(
+                request.block_hashes, max(replay_start, 0)
+            )
+            self.num_replay_hit_shrinks += 1
+            if self.num_replay_hit_shrinks <= 16:
+                logger.info(
+                    "DS41 decoder replay: request %s prefix hit %d -> %d "
+                    "(num_tokens %d, K %d): cached window not exact (shrink #%d)",
+                    request.request_id,
+                    shrunk_from,
+                    num_hit_tokens,
+                    request.num_tokens,
+                    self.replay_rows,
+                    self.num_replay_hit_shrinks,
+                )
+        request.replay_exact_from = ds41_replay.replay_exact_from(
+            request.num_tokens, num_hit_tokens, self.replay_rows
+        )
+        return computed_blocks, num_hit_tokens
 
     def allocate_slots(
         self,
@@ -609,6 +682,10 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def take_demand_release_ids(self) -> list[int]:
+        """Drain block ids whose physical KV pages can be unmapped."""
+        return self.coordinator.block_pool.take_demand_release_ids()
 
     def take_boundary_state_offloads(
         self,

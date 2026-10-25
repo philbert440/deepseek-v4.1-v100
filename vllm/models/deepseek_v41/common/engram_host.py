@@ -22,10 +22,51 @@ Per step (hooks called by L-CORE, §3.6):
   dummy_rows(...)    AM-2: profiling / CUDA-graph-capture forwards (ForwardContext.is_dummy_run) get zero rows.
 Two pinned/device slots alternate so step k+1's gather and copy overlap step k's compute; the copy into a device
 slot waits for the event recorded after that slot's previous expansion.
+
+Lookahead (VLLM_DS41_ENGRAM_LOOKAHEAD_TOKENS = W > 0; default 0 = off). The first PP stage has no PP receive to hide
+the step gather behind, so in chunked prefill every chunk's ~12K cold rows per rank were read on the critical path
+(the CPU blocks in wait_rows before layer 1). With W > 0, begin_step(k) also submits, at mid priority (after any
+step gather, before the WILLNEED warm-up), a real gather of the next W prompt positions of every request still in
+its prompt into a host-side lookahead buffer (sorted unique keys -> rows). begin_step(k+1) serves its keys from that
+buffer (a host copy in _issue_h2d once the lookahead job is done) and reads only the misses. Rows are a pure function
+of the key, so the staged bytes are identical. Two lookahead buffers alternate (fill one during step k, consume the
+other). With lookahead on, the whole-prompt admission WILLNEED defaults to off (VLLM_DS41_ENGRAM_PREFETCH=1 still
+forces it): on ZFS it is async-read class I/O (3 in flight per vdev) issued in table-offset order, so it warms every
+chunk a little instead of the next chunk fully, and it fills the ARC with 16 KiB records of the whole prompt.
+VLLM_DS41_ENGRAM_PREFETCH_ORDER=position issues that warm-up in prompt order instead of offset order.
+
+RAM-resident rows (VLLM_DS41_ENGRAM_RESIDENT=1; default 0 = the pread path above, unchanged). At init each rank
+loads the 256-byte rows of ITS OWN sub-tables (6 of 24 at TP4, ~48 GB per rank for layers 1 + 14) into one anonymous
+mapping per layer (MADV_HUGEPAGE, mbind-interleaved over NUMA nodes: _RESIDENT_NODES; NOT page-locked), with large
+multi-threaded sequential preads from the same sha256-verified shards, laid out like the rank's scale table (sub-tables concatenated in rank order, so the scale index
+of a row is also its resident row index). Ranks load one at a time under a host-wide flock and each refuses to start
+unless MemAvailable >= its tables + _RESIDENT_MARGIN_GIB. A sample of rows is then re-read with pread and compared.
+The step gather becomes a memcpy per unique row (csrc/engram_resident.cpp) into the same pinned staging, done inline
+in begin_step: no reader threads, no WILLNEED, no lookahead (forced off), same 264-byte records.
+Measured on 8x V100-SXM2 (ZFS 2.4, recordsize 16K, one 990): the load runs at ~1 GB/s (32-64 threads, 1-2 MiB preads; dd
+alone does ~0.6), i.e. ~50 s per rank / ~3.5 min for 4 ranks, and O_DIRECT does NOT keep the blocks out of the ARC
+there (it grows ~0.8 GiB per GiB loaded until zfs_arc_max) -- lower zfs_arc_max for resident serving.
+
+Slice lane (VLLM_DS41_SLICED_PREFILL=1; default 0 = not allocated; hol-design.md §2a). Layer-sliced prefill runs one
+STAGED prompt chunk a few layers per engine step, after the step's decode forward, so the chunk reaches layer 1 and
+layer 14 in different engine steps while the decode batch keeps using the step slots above. The lane has its own
+pinned/device staging, index map, dense buffer and events (no scratch shared with the step slots); one staged chunk
+per stage at a time:
+  begin_slice(req_id, start_pos, num_tokens, prompt_token_ids)  when the chunk is STAGED: hash the chunk (prompt
+                     positions only) and submit its gather (mid priority: behind the step gathers). RAM-resident: a
+                     memcpy done inline. Never waits for I/O. Returns a handle.
+  rows_ready(handle) cheap, non-blocking: has the gather finished (always True when resident)?
+  slice_lane(handle) context manager around a slice forward: while active, rows_buffer / wait_rows serve the slice
+                     (the Engram module is unchanged). wait_rows_slice(handle, layer) is the same thing called directly.
+  end_slice(handle)  after layer 14 consumed its rows, or on abort / preempt (drains a pending gather).
+The slice forward must run on the same CUDA stream as the step forwards (stream order protects the dense buffer and
+the next slice's H2D waits for the event recorded after the last expansion of this one).
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import json
 import mmap
@@ -65,7 +106,22 @@ PREFETCH_KNOB = "VLLM_DS41_ENGRAM_PREFETCH"                # admission prefetch 
 REQUIRE_VERIFIED_KNOB = "VLLM_DS41_ENGRAM_REQUIRE_VERIFIED"  # shard needs its <file>.sha256-ok sidecar
 BUILD_DIR_KNOB = "VLLM_DS41_ENGRAM_BUILD_DIR"              # torch extension build directory
 IO_THREADS_KNOB = "VLLM_DS41_ENGRAM_IO_THREADS"            # overrides the ctor's io_threads (CPU budget per rank)
+LOOKAHEAD_KNOB = "VLLM_DS41_ENGRAM_LOOKAHEAD_TOKENS"       # 0 = off; W > 0: gather the next W prompt positions early
+PREFETCH_ORDER_KNOB = "VLLM_DS41_ENGRAM_PREFETCH_ORDER"    # "offset" (default) | "position" (admission warm-up order)
+GATHER_WILLNEED_KNOB = "VLLM_DS41_ENGRAM_GATHER_WILLNEED"  # 1 (default): WILLNEED each miss before the blocking
+                                                           # preads; 0: plain preads (ZFS sync-read class)
+RESIDENT_KNOB = "VLLM_DS41_ENGRAM_RESIDENT"                # 1: the rank's row tables live in RAM (see docstring)
+RESIDENT_NODES_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_NODES"    # "all" (default: interleave over Mems_allowed) | "none"
+                                                           # (task policy) | "0,1" | per TP rank "0,1;0,1;1;1"
+RESIDENT_MARGIN_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_MARGIN_GIB"   # RAM that must stay available after the load (32)
+RESIDENT_THREADS_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_LOAD_THREADS"  # load threads per rank (32)
+RESIDENT_O_DIRECT_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_O_DIRECT"   # 1 (default): load with O_DIRECT (see docstring)
+RESIDENT_CHUNK_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_CHUNK_MIB"     # pread size of the load (2 MiB)
+RESIDENT_LOCK_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_LOCK"           # host-wide lock file serialising the loads
+RESIDENT_VERIFY_KNOB = "VLLM_DS41_ENGRAM_RESIDENT_VERIFY_ROWS"  # rows re-read with pread and compared (4096)
+SLICE_KNOB = "VLLM_DS41_SLICED_PREFILL"                    # 1: allocate the slice lane (see docstring)
 N_SLOTS = 2
+N_AHEAD = 2
 _LATENCY_WINDOW = 4096
 
 
@@ -73,11 +129,25 @@ _LATENCY_WINDOW = 4096
 @functools.lru_cache(maxsize=1)
 def load_engram_rows_extension() -> Any:
     """Build/load csrc/engram_rows.cpp as a runtime torch extension (no CMakeLists entry at P2)."""
-    src = Path(__file__).resolve().parents[4] / "csrc" / "engram_rows.cpp"
+    return _load_extension("ds41_engram_rows", "engram_rows.cpp", "")
+
+
+@functools.lru_cache(maxsize=1)
+def load_engram_resident_extension() -> Any:
+    """Build/load csrc/engram_resident.cpp (VLLM_DS41_ENGRAM_RESIDENT=1 only; own build sub-directory)."""
+    return _load_extension("ds41_engram_resident", "engram_resident.cpp", "resident")
+
+
+def _load_extension(name: str, source: str, subdir: str) -> Any:
+    src = Path(__file__).resolve().parents[4] / "csrc" / source
+    if not src.is_file():  # installed wheel: sources ship inside the package
+        src = Path(__file__).resolve().parents[3] / "_ds41_csrc" / source
     if not src.is_file():
         raise FileNotFoundError(f"Engram row reader source not found at {src} (needs a source checkout of 1Cat-vLLM)")
     default_dir = Path.home() / ".cache" / "vllm" / "ds41_engram_rows" / torch.__version__.replace("+", "_")
     build_dir = Path(knobs.env_str(BUILD_DIR_KNOB, str(default_dir)))
+    if subdir:
+        build_dir = build_dir / subdir
     build_dir.mkdir(parents=True, exist_ok=True)
     if shutil.which("ninja") is None:
         venv_ninja = Path(sys.executable).parent / "ninja"
@@ -86,7 +156,7 @@ def load_engram_rows_extension() -> Any:
         os.environ["PATH"] = f"{venv_ninja.parent}{os.pathsep}{os.environ.get('PATH', '')}"
     from torch.utils.cpp_extension import load
 
-    return load(name="ds41_engram_rows", sources=[str(src)], build_directory=str(build_dir),
+    return load(name=name, sources=[str(src)], build_directory=str(build_dir),
                 extra_cflags=["-O3", "-std=c++17"], verbose=False)
 
 
@@ -203,6 +273,260 @@ def _pread_into(fd: int, dst: np.ndarray, offset: int, path: str) -> None:
         done += n
 
 
+# ------------------------------------------------------------------------------------------------ resident tables
+def _parse_node_list(text: str) -> list[int]:
+    """'0-1,3' -> [0, 1, 3]."""
+    out: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b) if b else int(a)
+        if lo < 0 or hi < lo:
+            raise ValueError(f"bad NUMA node range {part!r}")
+        out.update(range(lo, hi + 1))
+    if not out:
+        raise ValueError(f"empty NUMA node list {text!r}")
+    return sorted(out)
+
+
+def mems_allowed() -> list[int]:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("Mems_allowed_list:"):
+                return _parse_node_list(line.split(":", 1)[1])
+    return [0]
+
+
+def parse_resident_nodes(spec: str, tp_rank: int) -> list[int] | None:
+    """VLLM_DS41_ENGRAM_RESIDENT_NODES for one rank: None = no mbind (the task's policy, e.g. numactl --membind),
+    else the interleave set. 'all' = every node in Mems_allowed; 'a;b;c;d' = one spec per TP rank."""
+    spec = spec.strip()
+    if ";" in spec:
+        parts = [p.strip() for p in spec.split(";")]
+        if tp_rank >= len(parts):
+            raise ValueError(f"{RESIDENT_NODES_KNOB}={spec!r} has {len(parts)} per-rank entries, TP rank {tp_rank}")
+        spec = parts[tp_rank]
+    if spec == "none":
+        return None
+    if spec == "all":
+        return mems_allowed()
+    try:
+        return _parse_node_list(spec)
+    except ValueError as exc:
+        raise ValueError(f"{RESIDENT_NODES_KNOB}={spec!r}: {exc} (expected all | none | 0,1 | 0,1;0,1;1;1)") from exc
+
+
+def meminfo_bytes(path: str = "/proc/meminfo") -> dict[str, int]:
+    out = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            # /proc/meminfo: "MemAvailable: 123 kB"; node meminfo: "Node 0 MemFree: 123 kB"
+            if len(parts) >= 3 and parts[-1] == "kB":
+                out[parts[-3].rstrip(":")] = int(parts[-2]) * 1024
+    return out
+
+
+def node_free_bytes() -> dict[int, int]:
+    out = {}
+    for p in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+        try:
+            out[int(p.name[4:])] = meminfo_bytes(str(p / "meminfo")).get("MemFree", 0)
+        except OSError:
+            pass
+    return out
+
+
+def zfs_arc_bytes() -> tuple[int, int] | None:
+    """(ARC size, c_min) or None without ZFS. The ARC is NOT in MemAvailable."""
+    try:
+        vals = {}
+        with open("/proc/spl/kstat/zfs/arcstats") as f:
+            for line in f.read().splitlines()[2:]:
+                k, _, v = line.split()
+                if k in ("size", "c_min"):
+                    vals[k] = int(v)
+        return vals["size"], vals["c_min"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def memory_report() -> str:
+    mi = meminfo_bytes()
+    arc = zfs_arc_bytes()
+    nodes = ", ".join(f"node {n} free {b / 2**30:.1f}" for n, b in node_free_bytes().items())
+    arc_s = f"ZFS ARC {arc[0] / 2**30:.1f} GiB (c_min {arc[1] / 2**30:.1f})" if arc else "no ZFS ARC"
+    return f"MemAvailable {mi.get('MemAvailable', 0) / 2**30:.1f} GiB, {nodes} GiB, {arc_s}"
+
+
+def check_resident_memory(need_bytes: int, margin_bytes: int, what: str) -> None:
+    """Refuse (clear error) instead of OOMing: MemAvailable must cover the tables plus the margin."""
+    avail = meminfo_bytes().get("MemAvailable", 0)
+    if avail < need_bytes + margin_bytes:
+        raise RuntimeError(
+            f"Engram resident: {what} needs {need_bytes / 2**30:.1f} GiB + {margin_bytes / 2**30:.0f} GiB margin "
+            f"({RESIDENT_MARGIN_KNOB}) but only {avail / 2**30:.1f} GiB is available ({memory_report()}). The ARC "
+            f"is not counted: lower zfs_arc_max (the resident tables replace it for Engram), free RAM, or unset "
+            f"{RESIDENT_KNOB} (the pread path).")
+
+
+@contextlib.contextmanager
+def host_lock(path: str):
+    """Host-wide exclusive flock (ranks load one at a time, so each memory check sees the previous loads)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def resident_ranges(weight_offset: int, sub_offset: np.ndarray, sub_rows: np.ndarray,
+                    base: np.ndarray) -> np.ndarray:
+    """[S, 3] int64 (file offset, resident byte offset, nbytes) of one layer's rank-local sub-tables: resident row
+    ``base[j] + local`` = global row ``sub_offset[j] + local`` (the scale table's layout)."""
+    return np.stack([weight_offset + sub_offset.astype(np.int64) * ROW_VALUE_BYTES,
+                     base.astype(np.int64) * ROW_VALUE_BYTES,
+                     sub_rows.astype(np.int64) * ROW_VALUE_BYTES], axis=1).astype(np.int64)
+
+
+class ResidentRowTables:
+    """One rank's resident row tables (one anonymous mapping per layer), filled from the shards."""
+
+    def __init__(self, ext: Any, paths: list[str], ranges: list[np.ndarray], nodes: list[int] | None,
+                 threads: int, o_direct: bool, chunk_bytes: int) -> None:
+        self.paths, self.ranges = list(paths), [np.ascontiguousarray(r, np.int64) for r in ranges]
+        self.nodes = nodes
+        self.tables: list[torch.Tensor] = []
+        t0 = time.perf_counter()
+        for path, rg in zip(self.paths, self.ranges):
+            nbytes = int((rg[:, 1] + rg[:, 2]).max())
+            t = ext.alloc_resident(nbytes, list(nodes or []), True)
+            got, _ns = ext.fill_resident(t, path, torch.from_numpy(rg), int(threads), bool(o_direct), int(chunk_bytes))
+            if got != int(rg[:, 2].sum()):
+                raise RuntimeError(f"Engram resident: loaded {got} B of {int(rg[:, 2].sum())} from {path}")
+            self.tables.append(t)
+        self.load_seconds = time.perf_counter() - t0
+        self.nbytes = sum(t.numel() for t in self.tables)
+
+    def verify(self, n_rows: int, seed: int) -> int:
+        """Re-read ~n_rows rows (plus the first and last row of every range) with pread and compare the bytes."""
+        if n_rows <= 0:
+            return 0
+        rng = np.random.default_rng(seed)
+        per = max(1, n_rows // max(1, sum(r.shape[0] for r in self.ranges)))
+        checked = 0
+        for path, rg, t in zip(self.paths, self.ranges, self.tables):
+            arr = t.numpy()
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                for fo, d, n in rg.tolist():
+                    nr = n // ROW_VALUE_BYTES
+                    for p in np.unique(np.concatenate([[0, nr - 1], rng.integers(0, nr, per)])).tolist():
+                        want = os.pread(fd, ROW_VALUE_BYTES, fo + p * ROW_VALUE_BYTES)
+                        if arr[d + p * ROW_VALUE_BYTES:d + (p + 1) * ROW_VALUE_BYTES].tobytes() != want:
+                            raise RuntimeError(f"Engram resident: row at {path}:{fo + p * ROW_VALUE_BYTES} differs "
+                                               "from the loaded copy (load bug or a shard changed under us)")
+                        checked += 1
+            finally:
+                os.close(fd)
+        return checked
+
+    def placement(self) -> str:
+        """Per-node GiB of the mappings holding the tables (/proc/self/maps + numa_maps; adjacent tables may share
+        one VMA, which is then reported once)."""
+        try:
+            vmas = []
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    a, b = line.split()[0].split("-")
+                    vmas.append((int(a, 16), int(b, 16)))
+            mine = {a for a, b in vmas for t in self.tables if a <= t.data_ptr() < b}
+            nodes: dict[int, float] = {}
+            with open("/proc/self/numa_maps") as f:
+                for line in f:
+                    addr, *fields = line.split()
+                    if int(addr, 16) not in mine:
+                        continue
+                    kb = next((int(x.split("=")[1]) for x in fields if x.startswith("kernelpagesize_kB=")), 4)
+                    for x in fields:
+                        if x[:1] == "N" and "=" in x and x[1:].split("=")[0].isdigit():
+                            n = int(x[1:].split("=")[0])
+                            nodes[n] = nodes.get(n, 0.0) + int(x.split("=")[1]) * kb / 2**20
+        except (OSError, ValueError):
+            return "n/a"
+        return ", ".join(f"N{n} {g:.2f} GiB" for n, g in sorted(nodes.items())) or "n/a"
+
+    def release(self) -> None:
+        self.tables = []
+
+
+class _ResidentReader:
+    """Drop-in for the C++ RowReader (same submit/wait/done/... surface) over resident tables: submit gathers at once
+    (rows[xtab[i]][xidx[i]] || scales[xtab[i]][xidx[i]]); the file offsets are not used. Tickets are born done."""
+
+    def __init__(self, ext: Any, tables: ResidentRowTables) -> None:
+        self._ext = ext
+        self._tables = tables
+        self._rows = list(tables.tables)
+        self._extras: list[torch.Tensor] = []
+        self._extra_bytes = 0
+        self._jobs: dict[int, list[int]] = {}
+        self._next = 1
+        self._willneed = False
+
+    def add_table(self, t: torch.Tensor, entry_bytes: int) -> int:
+        i = len(self._extras)
+        if i >= len(self._rows) or t.numel() != self._rows[i].numel() // ROW_VALUE_BYTES * entry_bytes:
+            raise ValueError(f"Engram resident: extra table {i} ({t.numel()} B) does not match resident table {i}")
+        self._extras.append(t)
+        self._extra_bytes = int(entry_bytes)
+        return i
+
+    def submit(self, file_idx, offsets, xtab, xidx, dst, dst_stride: int, row_bytes: int, priority: int = 0) -> int:
+        if row_bytes != ROW_VALUE_BYTES:
+            raise ValueError(f"Engram resident: row_bytes {row_bytes} != {ROW_VALUE_BYTES}")
+        n = int(xidx.numel())
+        ns = self._ext.gather_resident(self._rows, self._extras, xtab, xidx, dst, int(dst_stride), int(row_bytes),
+                                       self._extra_bytes)
+        ticket, self._next = self._next, self._next + 1
+        self._jobs[ticket] = [n, n, 0, 0, int(ns)]
+        return ticket
+
+    def done(self, ticket: int) -> bool:
+        if ticket not in self._jobs:
+            raise RuntimeError(f"Engram resident: unknown or already-waited ticket {ticket}")
+        return True
+
+    def wait(self, ticket: int) -> list[int]:
+        if ticket not in self._jobs:
+            raise RuntimeError(f"Engram resident: unknown or already-waited ticket {ticket}")
+        return self._jobs.pop(ticket)
+
+    def prefetch(self, file_idx, offsets, row_bytes: int) -> int:
+        return 0                                  # nothing to warm: rows are in RAM
+
+    def pending_prefetch_rows(self) -> int:
+        return 0
+
+    def drop_cache(self, file: int) -> None:
+        pass
+
+    def set_gather_willneed(self, on: bool) -> None:
+        self._willneed = bool(on)
+
+    def gather_willneed(self) -> bool:
+        return self._willneed
+
+    def shutdown(self) -> None:
+        self._rows, self._extras = [], []
+        self._jobs.clear()
+        self._tables.release()
+
+
 # ------------------------------------------------------------------------------------------------ request state
 class _History:
     """Compressed token ids of one request by absolute position.
@@ -254,6 +578,55 @@ class _Step:
     h2d_issued: bool = False
     expanded: bool = False
     t_pad: int = 0
+    # lookahead hits: (buffer, source rows in the buffer, first destination row in the slot); copied in _issue_h2d
+    copies: list[tuple[_AheadBuffer, np.ndarray, int]] = field(default_factory=list)
+
+
+@dataclass
+class _Slice:
+    handle: int
+    req_id: str
+    start_pos: int
+    n: int
+    t_pad: int
+    n_unique: int                       # unique rows in the slice slot (row 0 = zero row excluded)
+    tickets: list[int] = field(default_factory=list)
+    t_begin: float = 0.0
+    h2d_issued: bool = False
+    expanded: set[int] = field(default_factory=set)    # layer indices already expanded into the dense buffer
+
+
+class _AheadBuffer:
+    """Rows of one lookahead gather: ``keys`` (sorted, unique, (layer << 40) | row) -> ``rows[i]`` [264 B], written by
+    one reader job (``ticket``). Not usable until the job is waited for (``_ahead_ready``)."""
+
+    def __init__(self, cap_rows: int) -> None:
+        self.cap = int(cap_rows)
+        self.rows = torch.empty((max(self.cap, 1), ENGRAM_ROW_BYTES), dtype=torch.uint8, device="cpu")
+        self.keys = np.empty(0, np.int64)
+        self.ticket: int | None = None
+
+    def clear(self) -> None:
+        self.keys = np.empty(0, np.int64)
+
+
+def split_lookahead_hits(keys: np.ndarray, ahead_keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """keys, ahead_keys: sorted unique int64. Returns (hit mask over keys, index into ahead_keys of every hit)."""
+    if ahead_keys.size == 0 or keys.size == 0:
+        return np.zeros(keys.shape[0], bool), np.empty(0, np.int64)
+    pos = np.searchsorted(ahead_keys, keys)
+    pos_c = np.minimum(pos, ahead_keys.shape[0] - 1)
+    hit = ahead_keys[pos_c] == keys
+    return hit, pos_c[hit].astype(np.int64)
+
+
+def misses_first(inv: np.ndarray, hit: np.ndarray) -> tuple[np.ndarray, int]:
+    """Renumber the unique keys so the misses (in their sorted order) come first, then the hits (sorted order).
+    ``inv`` indexes the unique keys; returns (renumbered inv, number of misses)."""
+    order = np.concatenate([np.flatnonzero(~hit), np.flatnonzero(hit)])
+    new_pos = np.empty(hit.shape[0], np.int64)
+    new_pos[order] = np.arange(hit.shape[0])
+    return new_pos[inv], int(hit.shape[0] - int(hit.sum()))
 
 
 class EngramHostService:
@@ -290,7 +663,16 @@ class EngramHostService:
         self.device = torch.device(device)
         self.max_tokens = int(max_num_batched_tokens)
         self.o_direct = knobs.env_bool(O_DIRECT_KNOB, False)
-        self.prefetch_enabled = knobs.env_bool(PREFETCH_KNOB, True) and not self.o_direct
+        self.lookahead_tokens = knobs.env_int(LOOKAHEAD_KNOB, 0, minimum=0, maximum=self.max_tokens)
+        self.resident = knobs.env_bool(RESIDENT_KNOB, False)
+        self._resident: ResidentRowTables | None = None
+        if self.resident and self.lookahead_tokens:
+            logger.info("Engram resident: %s=%d ignored (rows are in RAM)", LOOKAHEAD_KNOB, self.lookahead_tokens)
+            self.lookahead_tokens = 0
+        # lookahead replaces the whole-prompt warm-up unless PREFETCH is set explicitly
+        self.prefetch_enabled = (knobs.env_bool(PREFETCH_KNOB, self.lookahead_tokens == 0) and not self.o_direct
+                                 and not self.resident)
+        self.prefetch_order = knobs.env_str(PREFETCH_ORDER_KNOB, "offset", choices=("offset", "position"))
         token_map = load_compressed_token_map(tokenizer_path, self.layout.compressed_vocab_size)
         self.hasher = EngramHasher(self.layout, token_map, self.layers, self.subtables)
 
@@ -332,11 +714,17 @@ class EngramHostService:
             self._scales.append(buf)
 
         io_threads = knobs.env_int(IO_THREADS_KNOB, int(io_threads), minimum=1, maximum=64)
-        ext = load_engram_rows_extension()
         paths = [loc.weight_path for loc in self.tables]
         uniq_paths = sorted(set(paths))
         self._file_of_layer = np.array([uniq_paths.index(p) for p in paths], np.int32)
-        self._reader = ext.RowReader(uniq_paths, int(io_threads), self.o_direct)
+        if self.resident:
+            self._resident = self._load_resident()
+            self._reader = _ResidentReader(load_engram_resident_extension(), self._resident)
+        else:
+            ext = load_engram_rows_extension()
+            self._reader = ext.RowReader(uniq_paths, int(io_threads), self.o_direct)
+        self.gather_willneed = knobs.env_bool(GATHER_WILLNEED_KNOB, True)
+        self._reader.set_gather_willneed(self.gather_willneed)
         self._table_ids = [self._reader.add_table(b.tensor, ROW_SCALE_BYTES) for b in self._scales]
         self._table_ids_arr = np.array(self._table_ids, np.int32)
         self.io_threads = int(io_threads)
@@ -357,18 +745,78 @@ class EngramHostService:
         self._h2d_recorded = [False] * N_SLOTS
         self._consumed_recorded = [False] * N_SLOTS
         self._next_slot = 0
+        # lookahead buffers (plain CPU memory: only the reader writes and a host copy reads them); [0] is filled by
+        # the newest begin_step, [1] holds the rows gathered one step earlier (consumed by the current step)
+        self._ahead: list[_AheadBuffer] = []
+        if self.lookahead_tokens > 0:
+            cap = self.lookahead_tokens * L * S
+            self._ahead = [_AheadBuffer(cap) for _ in range(N_AHEAD)]
+
+        # -- slice lane: one slot, allocated only with the knob (~2 x max_unique x 264 B + dense, pinned + device)
+        self.slice_enabled = knobs.env_bool(SLICE_KNOB, False)
+        self._slice: _Slice | None = None
+        self._slice_lane: int | None = None
+        self._next_handle = 1
+        if self.slice_enabled:
+            self._slice_host_rows = torch.zeros((self.max_unique, ENGRAM_ROW_BYTES), dtype=torch.uint8,
+                                                device="cpu").pin_memory()
+            self._slice_host_idx = torch.zeros(L * self.max_tokens * S, dtype=torch.int32, device="cpu").pin_memory()
+            self._slice_dev_rows = torch.zeros((self.max_unique, ENGRAM_ROW_BYTES), dtype=torch.uint8,
+                                               device=self.device)
+            self._slice_dev_idx = torch.zeros(L * self.max_tokens * S, dtype=torch.int32, device=self.device)
+            self._slice_dense = torch.zeros((L, self.max_tokens, S, ENGRAM_ROW_BYTES), dtype=torch.uint8,
+                                            device=self.device)
+            self._slice_h2d_done = torch.cuda.Event()
+            self._slice_consumed = torch.cuda.Event()
+            self._slice_h2d_recorded = False
+            self._slice_consumed_recorded = False
 
         self._hist: dict[str, _History] = {}
         self._step: _Step | None = None
         self._stats = dict(steps=0, dummy_steps=0, lookups=0, unique_rows=0, hits=0, misses=0, pages=0, prefetch_rows=0,
-                           wait_blocked_s=0.0, h2d_bytes=0)
+                           wait_blocked_s=0.0, h2d_bytes=0, lookahead_rows=0, lookahead_hits=0, lookahead_wait_s=0.0,
+                           slices=0, slice_rows=0, slice_wait_blocked_s=0.0)
         self._lat_ms: list[float] = []
         self.init_seconds = time.perf_counter() - t0
         logger.info("Engram host service: layers %s, TP rank %d/%d sub-tables %s, scales %.2f GiB page-locked, "
-                    "row bias %s, scale exponents %s, %d I/O threads (%s), staging %.1f MiB/slot, init %.1f s",
+                    "row bias %s, scale exponents %s, %d I/O threads (%s), staging %.1f MiB/slot, lookahead %d "
+                    "tokens, admission prefetch %s, init %.1f s",
                     self.layers, tp_rank, tp_size, self.subtables, self.pinned_scale_bytes / 2**30, self._row_bias,
-                    self.scale_exponent_range, io_threads, "O_DIRECT" if self.o_direct else "buffered",
-                    self.max_unique * ENGRAM_ROW_BYTES / 2**20, self.init_seconds)
+                    self.scale_exponent_range, 0 if self.resident else io_threads,
+                    "RAM-resident rows" if self.resident else "O_DIRECT" if self.o_direct else "buffered",
+                    self.max_unique * ENGRAM_ROW_BYTES / 2**20, self.lookahead_tokens,
+                    self.prefetch_order if self.prefetch_enabled else "off", self.init_seconds)
+
+    def _load_resident(self) -> ResidentRowTables:
+        """VLLM_DS41_ENGRAM_RESIDENT=1: load this rank's sub-table rows into RAM (one rank at a time per host)."""
+        L = len(self.layers)
+        ranges = [resident_ranges(int(self._weight_offset[l]), self._sub_offset[l], self._sub_rows[l],
+                                  self._scale_base[l]) for l in range(L)]
+        need = sum(int(r[:, 2].sum()) for r in ranges)
+        nodes = parse_resident_nodes(knobs.env_str(RESIDENT_NODES_KNOB, "all"), self.tp_rank)
+        margin = knobs.env_int(RESIDENT_MARGIN_KNOB, 32, minimum=0, maximum=4096) << 30
+        threads = knobs.env_int(RESIDENT_THREADS_KNOB, 32, minimum=1, maximum=64)
+        o_direct = knobs.env_bool(RESIDENT_O_DIRECT_KNOB, True)
+        chunk = knobs.env_int(RESIDENT_CHUNK_KNOB, 2, minimum=1, maximum=1024) << 20
+        n_verify = knobs.env_int(RESIDENT_VERIFY_KNOB, 4096, minimum=0)
+        lock = knobs.env_str(RESIDENT_LOCK_KNOB, "/tmp/ds41-engram-resident.lock")
+        ext = load_engram_resident_extension()
+        t_wait = time.perf_counter()
+        with host_lock(lock):
+            waited = time.perf_counter() - t_wait
+            what = f"TP rank {self.tp_rank} layers {self.layers} sub-tables {self.subtables}"
+            check_resident_memory(need, margin, what)
+            before = memory_report()
+            res = ResidentRowTables(ext, [loc.weight_path for loc in self.tables], ranges, nodes, threads, o_direct,
+                                    chunk)
+        checked = res.verify(n_verify, seed=self.tp_rank)
+        logger.info("Engram resident: %s: %.2f GiB loaded in %.1f s (%.2f GB/s, %d threads, %s, %d MiB preads, "
+                    "nodes %s; waited %.1f s for the host lock), %d rows verified by pread. Placement: %s. Before: "
+                    "%s. After: %s", what, res.nbytes / 2**30, res.load_seconds,
+                    res.nbytes / max(res.load_seconds, 1e-9) / 1e9, threads, "O_DIRECT" if o_direct else "buffered",
+                    chunk >> 20, "task policy" if nodes is None else nodes, waited, checked, res.placement(), before,
+                    memory_report())
+        return res
 
     # ---------------------------------------------------------------- properties used by the module / tests
     @property
@@ -383,21 +831,30 @@ class EngramHostService:
         return self._row_bias[layer_id]
 
     def rows_buffer(self, layer_id: int, num_tokens_padded: int) -> torch.Tensor:
-        """Static device view [T_pad, n_sub, 264] that wait_rows(layer_id) fills (stable across graph replays)."""
+        """Static device view [T_pad, n_sub, 264] that wait_rows(layer_id) fills (stable across graph replays). Inside
+        slice_lane(): the slice lane's own buffer (the chunk's T_pad must match begin_slice)."""
+        if self._slice_lane is not None:
+            sl = self._live_slice(self._slice_lane)
+            if num_tokens_padded != sl.t_pad:
+                raise ValueError(f"Engram slice {sl.handle}: forward has {num_tokens_padded} tokens, the staged chunk "
+                                 f"{sl.t_pad}")
+            return self._slice_dense[self.layers.index(layer_id), :num_tokens_padded]
         if num_tokens_padded > self.max_tokens:
             raise ValueError(f"Engram: {num_tokens_padded} tokens exceed max_num_batched_tokens {self.max_tokens}")
         return self._dense[self.layers.index(layer_id), :num_tokens_padded]
 
     # ---------------------------------------------------------------- key -> I/O addresses
-    def _addresses(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """rows [n, L, S] global row ids -> (inverse [n, L, S] into the unique keys, then per unique key: file index,
-        absolute byte offset of the 256-B row, scale table id, scale entry index). A global row id lies in exactly one
-        sub-table, so any occurrence of a key gives its sub-table column."""
+    def _addresses(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                                    np.ndarray]:
+        """rows [n, L, S] global row ids -> (inverse [n, L, S] into the unique keys, the sorted unique keys
+        (layer << 40) | row, then per unique key: file index, absolute byte offset of the 256-B row, scale table id,
+        scale entry index). A global row id lies in exactly one sub-table, so any occurrence of a key gives its
+        sub-table column."""
         n, L, S = rows.shape
         l_flat = np.broadcast_to(np.arange(L, dtype=np.int64)[None, :, None], (n, L, S)).reshape(-1)
         j_flat = np.broadcast_to(np.arange(S, dtype=np.int64)[None, None, :], (n, L, S)).reshape(-1)
         r_flat = rows.reshape(-1)
-        _, first, inv = np.unique((l_flat << 40) | r_flat, return_index=True, return_inverse=True)
+        keys, first, inv = np.unique((l_flat << 40) | r_flat, return_index=True, return_inverse=True)
         l_u, j_u, r_u = l_flat[first], j_flat[first], r_flat[first]
         local = r_u - self._sub_offset[l_u, j_u]
         if local.size and (int(local.min()) < 0 or bool((local >= self._sub_rows[l_u, j_u]).any())):
@@ -406,26 +863,77 @@ class EngramHostService:
         offsets = self._weight_offset[l_u] + r_u * ROW_VALUE_BYTES
         tab = self._table_ids_arr[l_u]
         sidx = self._scale_base[l_u, j_u] + local
-        return inv.reshape(n, L, S).astype(np.int32), file_idx, offsets, tab, sidx
+        return inv.reshape(n, L, S).astype(np.int32), keys, file_idx, offsets, tab, sidx
 
-    def _submit_rows(self, rows: np.ndarray, slot: int, first_unique: int) -> tuple[np.ndarray, int, int]:
+    def _submit_rows(self, rows: np.ndarray, slot: int, first_unique: int,
+                     step: _Step | None = None, host_rows: torch.Tensor | None = None,
+                     priority: int = 0) -> tuple[np.ndarray, int, int]:
         """Gather the unique rows of ``rows`` [n, L, S] into slot rows [first_unique, ...). Returns (inverse+offset,
-        number of unique rows, ticket)."""
-        inv, file_idx, offsets, tab, sidx = self._addresses(rows)
+        number of unique rows, ticket). With ``step`` and a filled lookahead buffer, keys found there are not read:
+        they take the slot rows after the misses and ``step.copies`` records the host copy _issue_h2d performs."""
+        inv, keys, file_idx, offsets, tab, sidx = self._addresses(rows)
         n_u = offsets.shape[0]
         if first_unique + n_u > self.max_unique:
             raise RuntimeError(f"Engram staging overflow: {first_unique + n_u} rows > {self.max_unique}")
-        dst = self._host_rows[slot, first_unique:first_unique + n_u].view(-1)
+        n_read = n_u
+        if step is not None and self._ahead and self._ahead[1].keys.size:
+            buf = self._ahead[1]
+            hit, src = split_lookahead_hits(keys, buf.keys)
+            if src.size:
+                inv, n_read = misses_first(inv, hit)
+                miss = ~hit
+                file_idx, offsets, tab, sidx = file_idx[miss], offsets[miss], tab[miss], sidx[miss]
+                step.copies.append((buf, src, first_unique + n_read))
+                self._stats["lookahead_hits"] += int(src.size)
+        rows_t = self._host_rows[slot] if host_rows is None else host_rows
+        dst = rows_t[first_unique:first_unique + n_read].view(-1)
         ticket = self._reader.submit(torch.from_numpy(file_idx), torch.from_numpy(offsets),
                                      torch.from_numpy(tab), torch.from_numpy(sidx), dst, ENGRAM_ROW_BYTES,
-                                     ROW_VALUE_BYTES)
+                                     ROW_VALUE_BYTES, priority)
         self._stats["lookups"] += int(rows.size)
         self._stats["unique_rows"] += n_u
-        return inv + first_unique, n_u, ticket
+        return (inv + first_unique).astype(np.int32), n_u, ticket
+
+    def _ahead_ready(self, buf: _AheadBuffer) -> None:
+        """Block until ``buf``'s lookahead job is done (normally it finished during the previous step)."""
+        if buf.ticket is None:
+            return
+        t0 = time.perf_counter()
+        self._reader.wait(buf.ticket)
+        self._stats["lookahead_wait_s"] += time.perf_counter() - t0
+        buf.ticket = None
+
+    def _rotate_lookahead(self) -> None:
+        """Start of begin_step: [1] becomes the buffer gathered during the previous step (this step's hits), [0] the
+        one this step refills. [0] last served the previous step, whose host copies ran in its _issue_h2d (or were
+        dropped with an aborted step); its own job is drained before the buffer is reused."""
+        self._ahead.reverse()
+        self._ahead_ready(self._ahead[0])
+        self._ahead[0].clear()
+
+    def _submit_lookahead(self, rows: list[np.ndarray]) -> None:
+        """Gather ``rows`` (each [n, L, S]) into lookahead buffer [0] at mid priority (after step gathers)."""
+        buf = self._ahead[0]
+        if not rows:
+            return
+        _, keys, file_idx, offsets, tab, sidx = self._addresses(np.concatenate(rows, axis=0))
+        n = keys.shape[0]
+        if n > buf.cap:
+            raise RuntimeError(f"Engram lookahead overflow: {n} rows > {buf.cap}")
+        buf.ticket = self._reader.submit(torch.from_numpy(file_idx), torch.from_numpy(offsets),
+                                         torch.from_numpy(tab), torch.from_numpy(sidx), buf.rows[:n].view(-1),
+                                         ENGRAM_ROW_BYTES, ROW_VALUE_BYTES, 1)
+        buf.keys = keys
+        self._stats["lookahead_rows"] += n
 
     def _prefetch_rows(self, rows: np.ndarray) -> None:
         n, L, S = rows.shape
-        keys = np.unique(((np.arange(L, dtype=np.int64)[None, :, None] << 40) | rows).reshape(-1))
+        flat = ((np.arange(L, dtype=np.int64)[None, :, None] << 40) | rows).reshape(-1)
+        if self.prefetch_order == "position":   # warm the prompt front to back (unique keys by first occurrence)
+            _, first = np.unique(flat, return_index=True)
+            keys = flat[np.sort(first)]
+        else:                                   # today: table-offset order
+            keys = np.unique(flat)
         l_idx = keys >> 40
         offsets = self._weight_offset[l_idx] + (keys & ((1 << 40) - 1)) * ROW_VALUE_BYTES
         self._reader.prefetch(torch.from_numpy(self._file_of_layer[l_idx].astype(np.int32)),
@@ -440,6 +948,10 @@ class EngramHostService:
         self._retire_step()
         for rid in plan.finished_req_ids:
             self._hist.pop(rid, None)
+        if self._ahead:
+            self._rotate_lookahead()
+        ahead_rows: list[np.ndarray] = []
+        ahead_budget = self.lookahead_tokens
         slot = self._next_slot
         self._next_slot ^= 1
         if self._h2d_recorded[slot]:
@@ -482,6 +994,10 @@ class EngramHostService:
                 known_meta.append((off, n))
                 if r.prompt_token_ids is not None and self.prefetch_enabled and start + n < hist.length:
                     prefetch.append(self.hasher.hash_positions(hist.view(), np.arange(start + n, hist.length)))
+                if ahead_budget > 0 and start + n < hist.prompt_len:   # the next chunk of a prompt being prefilled
+                    end = min(hist.prompt_len, start + n + ahead_budget)
+                    ahead_rows.append(self.hasher.hash_positions(hist.view(), np.arange(start + n, end)))
+                    ahead_budget -= end - (start + n)
             reqs[r.req_id] = _ReqSlot(off=off, n=n, start_pos=start, resolved=resolved)
             off += n
         L, S = len(self.layers), self.n_sub
@@ -490,7 +1006,7 @@ class EngramHostService:
                      t_begin=time.perf_counter())
         if known_rows:
             rows = np.concatenate(known_rows, axis=0)
-            kinv, n_u, ticket = self._submit_rows(rows, slot, 1)
+            kinv, n_u, ticket = self._submit_rows(rows, slot, 1, step)
             step.tickets.append(ticket)
             self._step = step          # published at once: a later exception still leaves the gather owned/drained
             pos = 0
@@ -500,6 +1016,8 @@ class EngramHostService:
             step.n_unique = n_u
         self._step = step
         self._stats["steps"] += 1
+        if self._ahead:
+            self._submit_lookahead(ahead_rows)
         for rows in prefetch:
             self._prefetch_rows(rows)
 
@@ -542,7 +1060,8 @@ class EngramHostService:
         self._host_idx[step.slot, : L * t_pad * S].numpy()[:] = idx.reshape(-1)
         step.layout = layout
         step.t_pad = t_pad
-        if all(self._reader.done(t) for t in step.tickets):
+        if all(self._reader.done(t) for t in step.tickets) and all(
+                buf.ticket is None or self._reader.done(buf.ticket) for buf, _, _ in step.copies):
             self._issue_h2d(step)
 
     def _resolve_sampled(self, step: _Step, layout: EngramBatchLayout, unresolved: list[tuple[int, str]]) -> None:
@@ -582,6 +1101,11 @@ class EngramHostService:
         if len(self._lat_ms) > _LATENCY_WINDOW:
             del self._lat_ms[: len(self._lat_ms) - _LATENCY_WINDOW]
         slot = step.slot
+        for buf, src, dst0 in step.copies:     # lookahead hits -> slot rows after the misses
+            self._ahead_ready(buf)
+            torch.index_select(buf.rows, 0, torch.from_numpy(src),
+                               out=self._host_rows[slot, dst0:dst0 + src.shape[0]])
+        step.copies.clear()
         n_rows = step.n_unique + 1
         n_idx = len(self.layers) * step.t_pad * self.n_sub
         with torch.cuda.stream(self._copy_stream):
@@ -597,6 +1121,8 @@ class EngramHostService:
     def wait_rows(self, layer_id: int) -> torch.Tensor:
         """Inside the Engram eager break: block the CPU until this step's rows are gathered and their H2D is enqueued,
         make the current stream wait for it, expand to the static device view [T_pad, n_sub, 264] u8 of layer_id."""
+        if self._slice_lane is not None:
+            return self.wait_rows_slice(self._slice_lane, layer_id)
         li = self.layers.index(layer_id)
         step = self._step
         if step is None or step.layout is None:
@@ -642,12 +1168,140 @@ class EngramHostService:
             step.tickets.clear()
         self._step = None
 
+    # ---------------------------------------------------------------- slice lane (hol-design §2a)
+    def begin_slice(self, req_id: str, start_pos: int, num_tokens: int,
+                    prompt_token_ids: np.ndarray | None = None, num_tokens_padded: int | None = None,
+                    token_ids: np.ndarray | None = None) -> int:
+        """Worker thread, when the chunk [start_pos, start_pos + num_tokens) of ``req_id`` is STAGED. Prompt positions
+        only (the sampled tail takes the normal step path). History, as begin_step: ``prompt_token_ids`` (full prompt)
+        creates it; ``token_ids`` (this chunk's ids, SliceDirective.token_ids) creates it at start_pos 0 or extends a
+        history known up to start_pos, and marks the chunk as prompt (never rolled back); with neither, the chunk must
+        lie inside the known prompt. Never blocks on I/O (a CPU wait happens only if the previous slice's H2D has not
+        finished reading the pinned slot)."""
+        if not self.slice_enabled:
+            raise RuntimeError(f"Engram: begin_slice needs {SLICE_KNOB}=1 (the slice lane is not allocated)")
+        if self._slice is not None:
+            raise RuntimeError(f"Engram: begin_slice({req_id!r}) while slice {self._slice.handle} "
+                               f"({self._slice.req_id!r}) is still staged: one staged chunk per stage")
+        start, n = int(start_pos), int(num_tokens)
+        t_pad = n if num_tokens_padded is None else int(num_tokens_padded)
+        if n <= 0 or t_pad < n or t_pad > self.max_tokens:
+            raise ValueError(f"Engram: slice of {n} tokens (T_pad {t_pad}) outside (0, {self.max_tokens}]")
+        if prompt_token_ids is not None:
+            self._hist[req_id] = _History(self.hasher.compress(np.asarray(prompt_token_ids)))
+        if token_ids is not None:
+            ids = np.asarray(token_ids)
+            if ids.shape != (n,):
+                raise ValueError(f"Engram: slice of request {req_id} token_ids {ids.shape} != num_tokens {n}")
+            hist = self._hist.get(req_id)
+            if hist is None and start == 0:
+                self._hist[req_id] = _History(self.hasher.compress(ids))
+            elif hist is None:
+                raise KeyError(f"Engram: slice of request {req_id} at {start} without token history")
+            else:
+                hist.write(start, self.hasher.compress(ids))           # raises on a gap
+                hist.prompt_len = max(hist.prompt_len, start + n)       # staged positions are prompt: keep them
+        hist = self._hist.get(req_id)
+        if hist is None:
+            raise KeyError(f"Engram: slice of request {req_id} without token history; its first (or resumed) work must "
+                           "carry prompt_token_ids")
+        if start < 0 or start + n > hist.prompt_len:
+            raise ValueError(f"Engram: slice positions [{start}, {start + n}) of request {req_id} are not prompt "
+                             f"positions (< {hist.prompt_len})")
+        if self._slice_h2d_recorded:
+            self._slice_h2d_done.synchronize()       # the previous slice's H2D still reads the pinned rows
+        rows = self.hasher.hash_positions(hist.view(), np.arange(start, start + n))
+        kinv, n_u, ticket = self._submit_rows(rows, -1, 1, host_rows=self._slice_host_rows, priority=1)
+        L, S = len(self.layers), self.n_sub
+        idx = np.zeros((L, t_pad, S), np.int32)
+        idx[:, :n] = kinv.transpose(1, 0, 2)
+        self._slice_host_idx[: L * t_pad * S].numpy()[:] = idx.reshape(-1)
+        sl = _Slice(handle=self._next_handle, req_id=req_id, start_pos=start, n=n, t_pad=t_pad, n_unique=n_u,
+                    tickets=[ticket], t_begin=time.perf_counter())
+        self._next_handle += 1
+        self._slice = sl
+        self._stats["slices"] += 1
+        self._stats["slice_rows"] += n_u
+        return sl.handle
+
+    def _live_slice(self, handle: int) -> _Slice:
+        sl = self._slice
+        if sl is None or sl.handle != handle:
+            raise RuntimeError(f"Engram: slice {handle} is not staged (current: {None if sl is None else sl.handle})")
+        return sl
+
+    def rows_ready(self, handle: int) -> bool:
+        """Non-blocking: the slice's gather has finished (its rows can be consumed without a CPU wait)."""
+        sl = self._live_slice(handle)
+        return sl.h2d_issued or all(self._reader.done(t) for t in sl.tickets)
+
+    def _slice_issue_h2d(self, sl: _Slice) -> None:
+        t0 = time.perf_counter()
+        for t in sl.tickets:
+            self._reader.wait(t)
+        sl.tickets.clear()
+        self._stats["slice_wait_blocked_s"] += time.perf_counter() - t0
+        n_rows = sl.n_unique + 1
+        n_idx = len(self.layers) * sl.t_pad * self.n_sub
+        with torch.cuda.stream(self._copy_stream):
+            if self._slice_consumed_recorded:
+                self._copy_stream.wait_event(self._slice_consumed)
+            self._slice_dev_rows[:n_rows].copy_(self._slice_host_rows[:n_rows], non_blocking=True)
+            self._slice_dev_idx[:n_idx].copy_(self._slice_host_idx[:n_idx], non_blocking=True)
+            self._slice_h2d_done.record(self._copy_stream)
+        self._slice_h2d_recorded = True
+        self._stats["h2d_bytes"] += n_rows * ENGRAM_ROW_BYTES + n_idx * 4
+        sl.h2d_issued = True
+
+    def wait_rows_slice(self, handle: int, layer_id: int) -> torch.Tensor:
+        """Inside the slice forward that reaches ``layer_id``: finish the gather / H2D if still pending, make the
+        current stream wait for it and expand THIS layer's rows into the lane's dense buffer [T_pad, n_sub, 264]."""
+        sl = self._live_slice(handle)
+        li = self.layers.index(layer_id)
+        if not sl.h2d_issued:
+            self._slice_issue_h2d(sl)
+        if li not in sl.expanded:
+            cur = torch.cuda.current_stream(self.device)
+            cur.wait_event(self._slice_h2d_done)
+            span = sl.t_pad * self.n_sub
+            out = self._slice_dense[li, : sl.t_pad].view(span, ENGRAM_ROW_BYTES)
+            torch.index_select(self._slice_dev_rows, 0, self._slice_dev_idx[li * span:(li + 1) * span], out=out)
+            self._slice_consumed.record(cur)
+            self._slice_consumed_recorded = True
+            sl.expanded.add(li)
+        return self._slice_dense[li, : sl.t_pad]
+
+    @contextlib.contextmanager
+    def slice_lane(self, handle: int):
+        """Route rows_buffer / wait_rows to the staged slice for the duration of one slice forward."""
+        self._live_slice(handle)
+        if self._slice_lane is not None:
+            raise RuntimeError(f"Engram: slice lane {self._slice_lane} already active")
+        self._slice_lane = handle
+        try:
+            yield
+        finally:
+            self._slice_lane = None
+
+    def end_slice(self, handle: int) -> None:
+        """After the chunk's last Engram layer consumed its rows, or on abort / preempt mid-slice (a pending gather
+        is drained so the slot can be reused). Ending an unknown handle raises; ending twice is an error too."""
+        sl = self._live_slice(handle)
+        if self._slice_lane == handle:
+            raise RuntimeError(f"Engram: end_slice({handle}) inside its own slice_lane")
+        for t in sl.tickets:
+            self._reader.wait(t)
+        sl.tickets.clear()
+        self._slice = None
+
     def stats(self) -> dict[str, float]:
         lat = np.array(self._lat_ms) if self._lat_ms else np.zeros(1)
         s = {k: float(v) for k, v in self._stats.items()}
         s.update(gather_p50_ms=float(np.percentile(lat, 50)), gather_p99_ms=float(np.percentile(lat, 99)),
                  gather_max_ms=float(lat.max()), warmup_backlog_rows=float(self._reader.pending_prefetch_rows()),
                  pinned_scale_gib=self.pinned_scale_bytes / 2**30, pinned_staging_mib=self.pinned_staging_bytes / 2**20)
+        if self._resident is not None:
+            s.update(resident_gib=self._resident.nbytes / 2**30, resident_load_s=self._resident.load_seconds)
         return s
 
     def drop_page_cache(self) -> None:
@@ -658,8 +1312,14 @@ class EngramHostService:
     def shutdown(self) -> None:
         """Joins the reader's threads BEFORE the staging/scale memory they write into or read from is released."""
         if getattr(self, "_reader", None) is not None:
+            sl = getattr(self, "_slice", None)
+            if sl is not None and sl.tickets:
+                for t in sl.tickets:
+                    self._reader.wait(t)
+                sl.tickets.clear()
             self._reader.shutdown()
             self._reader = None
+        self._resident = None          # drops the resident tables (munmap once no tensor references them)
         for b in getattr(self, "_scales", []):
             b.release()
         self._scales = []

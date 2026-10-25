@@ -295,6 +295,20 @@ class ModelRunnerOutput:
     # Completed GPU timing only; CUDA events never cross process boundaries.
     mixed_prefill_timing: MixedPrefillTiming | None = None
 
+    # DS41 (VLLM_DS41_FOLD_DRAFTS=1, sync scheduling): this step's drafts, returned with the output instead of a
+    # separate take_draft_token_ids RPC.
+    ds41_draft_token_ids: "DraftTokenIds | None" = None
+
+    # DS41 layer-sliced prefill (VLLM_DS41_SLICED_PREFILL=1, LAST PP stage only): (req_id, chunk_id) of the staged
+    # prefill chunks whose last stage-1 slice ran in this step; the scheduler advances num_computed_tokens on these.
+    ds41_slice_done: tuple[tuple[str, int], ...] = ()
+    # DS41 adaptive slice sizing (VLLM_DS41_SLICE_POLICY=adaptive): measured costs, last stage reports both stages
+    # (stage 0's arrive with the chunk handoff). Slices: (stage, layers, ms, first); decode steps: (stage, fwd_ms
+    # (+ post on the last stage), span_ms (last stage only, else 0), clean = neither this nor the previous step
+    # carried slices).
+    ds41_slice_ms: tuple[tuple[int, int, float, bool], ...] = ()
+    ds41_decode_ms: tuple[tuple[int, float, float, bool], ...] = ()
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

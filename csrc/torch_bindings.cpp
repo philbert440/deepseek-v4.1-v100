@@ -770,6 +770,59 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "weight) -> ()");
   ops.impl("sm70_glm53_fp16_gemv_out", torch::kCUDA, &sm70_glm53_fp16_gemv_out);
 
+  // EXL3 routed-expert MoE (trellis decode + mma.m8n8k4).
+  ops.def(
+      "exl3_moe_pre_out(Tensor(a!) out, Tensor(b!)? out2, Tensor x, "
+      "Tensor topk_ids, Tensor suh, Tensor? suh2) -> ()");
+  ops.impl("exl3_moe_pre_out", torch::kCUDA, &exl3_moe_pre_out);
+  ops.def(
+      "exl3_moe_gemv_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, Tensor? x2, "
+      "Tensor trellis, Tensor? trellis2, Tensor expert_ids, "
+      "Tensor? group_rows, bool colmajor, int codebook=0) -> ()");
+  ops.impl("exl3_moe_gemv_out", torch::kCUDA, &exl3_moe_gemv_out);
+  ops.def(
+      "exl3_moe_gemv_mixed_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, "
+      "Tensor? x2, Tensor trellis, Tensor? trellis2, Tensor offsets, "
+      "Tensor kbits, Tensor expert_ids, Tensor? group_rows, bool colmajor, "
+      "int codebook, int n, int ksplit=1) -> ()");
+  ops.impl("exl3_moe_gemv_mixed_out", torch::kCUDA, &exl3_moe_gemv_mixed_out);
+  ops.def(
+      "exl3_moe_mid_out(Tensor(a!) out, Tensor yg, Tensor yu, "
+      "Tensor topk_ids, Tensor g_svh, Tensor u_svh, Tensor d_suh, "
+      "float limit=0.0, int ksplit=1) -> ()");
+  ops.impl("exl3_moe_mid_out", torch::kCUDA, &exl3_moe_mid_out);
+  ops.def(
+      "exl3_moe_post_out(Tensor(a!) out, Tensor yd, Tensor topk_ids, "
+      "Tensor topk_weights, Tensor d_svh, int ksplit=1) -> ()");
+  ops.impl("exl3_moe_post_out", torch::kCUDA, &exl3_moe_post_out);
+  // EXL3 MoE prefill: routing plan, compacted rows, row-tiled expert GEMM.
+  ops.def(
+      "exl3_moe_plan_out(Tensor(a!) row_slot, Tensor(b!) slot_row, "
+      "Tensor(c!) row_exp, Tensor(d!) tiles, Tensor(e!) info, Tensor loc, "
+      "int num_experts, int t16, int t32, int dense_min=0) -> ()");
+  ops.impl("exl3_moe_plan_out", torch::kCUDA, &exl3_moe_plan_out);
+  ops.def(
+      "exl3_moe_pre_rows_out(Tensor(a!) out, Tensor(b!)? out2, Tensor x, "
+      "Tensor row_slot, Tensor row_exp, Tensor suh, Tensor? suh2, "
+      "int topk) -> ()");
+  ops.impl("exl3_moe_pre_rows_out", torch::kCUDA, &exl3_moe_pre_rows_out);
+  ops.def(
+      "exl3_moe_gemm_tiled_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, "
+      "Tensor? x2, Tensor trellis, Tensor? trellis2, Tensor offsets, "
+      "Tensor kbits, Tensor tiles, int row_tile, int codebook, int n, "
+      "int ksplit=1, int layout=0) -> ()");
+  ops.impl("exl3_moe_gemm_tiled_out", torch::kCUDA, &exl3_moe_gemm_tiled_out);
+  ops.def(
+      "exl3_moe_post_rows_out(Tensor(a!) out, Tensor yd, Tensor slot_row, "
+      "Tensor row_exp, Tensor d_svh, int ksplit=1) -> ()");
+  ops.impl("exl3_moe_post_rows_out", torch::kCUDA, &exl3_moe_post_rows_out);
+  ops.def(
+      "exl3_moe_reconstruct_out(Tensor(a!) w, Tensor trellis, int offset, "
+      "int K, int codebook) -> ()");
+  ops.impl("exl3_moe_reconstruct_out", torch::kCUDA, &exl3_moe_reconstruct_out);
+  ops.def("exl3_moe_dense_out(Tensor(a!) y, Tensor x, Tensor w) -> ()");
+  ops.impl("exl3_moe_dense_out", torch::kCUDA, &exl3_moe_dense_out);
+
   ops.def(
       "sm70_glm53_moe_permute_q8_out("
       "Tensor input, Tensor topk_ids, Tensor(a!) permuted_input, "

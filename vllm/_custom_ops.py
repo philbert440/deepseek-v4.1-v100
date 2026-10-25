@@ -653,6 +653,237 @@ if hasattr(torch.ops._C, "awq_gemm"):
 
 
 # gptq
+
+
+# exl3 routed-expert MoE
+def exl3_moe_pre_out(
+    out: torch.Tensor,
+    out2: torch.Tensor | None,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    suh: torch.Tensor,
+    suh2: torch.Tensor | None,
+) -> None:
+    torch.ops._C.exl3_moe_pre_out(out, out2, x, topk_ids, suh, suh2)
+
+
+def exl3_moe_gemv_out(
+    y: torch.Tensor,
+    y2: torch.Tensor | None,
+    x: torch.Tensor,
+    x2: torch.Tensor | None,
+    trellis: torch.Tensor,
+    trellis2: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    group_rows: torch.Tensor | None,
+    colmajor: bool,
+    codebook: int = 0,
+) -> None:
+    torch.ops._C.exl3_moe_gemv_out(
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor, codebook
+    )
+
+
+def exl3_moe_gemv_mixed_out(
+    y: torch.Tensor,
+    y2: torch.Tensor | None,
+    x: torch.Tensor,
+    x2: torch.Tensor | None,
+    trellis: torch.Tensor,
+    trellis2: torch.Tensor | None,
+    offsets: torch.Tensor,
+    kbits: torch.Tensor,
+    expert_ids: torch.Tensor,
+    group_rows: torch.Tensor | None,
+    colmajor: bool,
+    codebook: int,
+    n: int,
+    ksplit: int = 1,
+) -> None:
+    torch.ops._C.exl3_moe_gemv_mixed_out(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
+        colmajor, codebook, n, ksplit,
+    )
+
+
+def exl3_moe_mid_out(
+    out: torch.Tensor,
+    yg: torch.Tensor,
+    yu: torch.Tensor,
+    topk_ids: torch.Tensor,
+    g_svh: torch.Tensor,
+    u_svh: torch.Tensor,
+    d_suh: torch.Tensor,
+    limit: float = 0.0,
+    ksplit: int = 1,
+) -> None:
+    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit, ksplit)
+
+
+def exl3_moe_post_out(
+    out: torch.Tensor,
+    yd: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    d_svh: torch.Tensor,
+    ksplit: int = 1,
+) -> None:
+    torch.ops._C.exl3_moe_post_out(out, yd, topk_ids, topk_weights, d_svh, ksplit)
+
+
+def exl3_moe_plan_out(
+    row_slot: torch.Tensor,
+    slot_row: torch.Tensor,
+    row_exp: torch.Tensor,
+    tiles: torch.Tensor,
+    info: torch.Tensor,
+    loc: torch.Tensor,
+    num_experts: int,
+    t16: int,
+    t32: int,
+    dense_min: int = 0,
+) -> None:
+    torch.ops._C.exl3_moe_plan_out(
+        row_slot, slot_row, row_exp, tiles, info, loc, num_experts, t16, t32, dense_min
+    )
+
+
+def exl3_moe_pre_rows_out(
+    out: torch.Tensor,
+    out2: torch.Tensor | None,
+    x: torch.Tensor,
+    row_slot: torch.Tensor,
+    row_exp: torch.Tensor,
+    suh: torch.Tensor,
+    suh2: torch.Tensor | None,
+    topk: int,
+) -> None:
+    torch.ops._C.exl3_moe_pre_rows_out(out, out2, x, row_slot, row_exp, suh, suh2, topk)
+
+
+def exl3_moe_gemm_tiled_out(
+    y: torch.Tensor,
+    y2: torch.Tensor | None,
+    x: torch.Tensor,
+    x2: torch.Tensor | None,
+    trellis: torch.Tensor,
+    trellis2: torch.Tensor | None,
+    offsets: torch.Tensor,
+    kbits: torch.Tensor,
+    tiles: torch.Tensor,
+    row_tile: int,
+    codebook: int,
+    n: int,
+    ksplit: int = 1,
+    layout: int = 0,
+) -> None:
+    torch.ops._C.exl3_moe_gemm_tiled_out(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, tiles, row_tile, codebook, n, ksplit, layout
+    )
+
+
+def exl3_moe_post_rows_out(
+    out: torch.Tensor,
+    yd: torch.Tensor,
+    slot_row: torch.Tensor,
+    row_exp: torch.Tensor,
+    d_svh: torch.Tensor,
+    ksplit: int = 1,
+) -> None:
+    torch.ops._C.exl3_moe_post_rows_out(out, yd, slot_row, row_exp, d_svh, ksplit)
+
+
+def exl3_moe_reconstruct_out(
+    w: torch.Tensor, trellis: torch.Tensor, offset: int, K: int, codebook: int
+) -> None:
+    torch.ops._C.exl3_moe_reconstruct_out(w, trellis, offset, K, codebook)
+
+
+def exl3_moe_dense_out(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor) -> None:
+    torch.ops._C.exl3_moe_dense_out(y, x, w)
+
+
+def exl3_moe_available() -> bool:
+    return hasattr(torch.ops._C, "exl3_moe_gemv_out")
+
+
+def _load_exl3_addon() -> None:
+    """VLLM_DS41_EXL3_ADDON=<path to _C_ds41_exl3.so>: register the row-tiled EXL3 MoE ops into torch.ops._C for a
+    tree whose _C predates them (no-op when _C already has them, so a full rebuild never double-registers)."""
+    path = os.environ.get("VLLM_DS41_EXL3_ADDON", "")
+    if path and hasattr(torch.ops._C, "exl3_moe_gemv_out") and not hasattr(torch.ops._C, "exl3_moe_gemm_tiled_out"):
+        torch.ops.load_library(path)
+
+
+_load_exl3_addon()
+
+
+def exl3_moe_prefill_available() -> bool:
+    return hasattr(torch.ops._C, "exl3_moe_gemm_tiled_out")
+
+
+if hasattr(torch.ops._C, "exl3_moe_gemv_out"):
+
+    @register_fake("_C::exl3_moe_pre_out")
+    def _exl3_moe_pre_out_fake(out, out2, x, topk_ids, suh, suh2) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_gemv_out")
+    def _exl3_moe_gemv_out_fake(
+        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor, codebook=0
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_gemv_mixed_out")
+    def _exl3_moe_gemv_mixed_out_fake(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, expert_ids, group_rows,
+        colmajor, codebook, n, ksplit=1,
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_mid_out")
+    def _exl3_moe_mid_out_fake(
+        out, yg, yu, topk_ids, g_svh, u_svh, d_suh, limit=0.0, ksplit=1
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_post_out")
+    def _exl3_moe_post_out_fake(out, yd, topk_ids, topk_weights, d_svh, ksplit=1) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "exl3_moe_gemm_tiled_out"):
+
+    @register_fake("_C::exl3_moe_plan_out")
+    def _exl3_moe_plan_out_fake(
+        row_slot, slot_row, row_exp, tiles, info, loc, num_experts, t16, t32, dense_min=0
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_pre_rows_out")
+    def _exl3_moe_pre_rows_out_fake(out, out2, x, row_slot, row_exp, suh, suh2, topk) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_gemm_tiled_out")
+    def _exl3_moe_gemm_tiled_out_fake(
+        y, y2, x, x2, trellis, trellis2, offsets, kbits, tiles, row_tile, codebook, n, ksplit=1,
+        layout=0,
+    ) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_post_rows_out")
+    def _exl3_moe_post_rows_out_fake(out, yd, slot_row, row_exp, d_svh, ksplit=1) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_reconstruct_out")
+    def _exl3_moe_reconstruct_out_fake(w, trellis, offset, K, codebook) -> None:
+        return None
+
+    @register_fake("_C::exl3_moe_dense_out")
+    def _exl3_moe_dense_out_fake(y, x, w) -> None:
+        return None
+
+
 def gptq_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,

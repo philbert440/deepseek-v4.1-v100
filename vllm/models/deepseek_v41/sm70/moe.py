@@ -20,7 +20,10 @@ gate-up GEMV, the combine fused into the down GEMV); larger T uses cuBLAS with F
 Knobs (``knobs.py`` helpers): ``VLLM_DS41_MOE_IMPL`` = sm70 | torch (per-expert FP32-dequantised oracle, §7.1);
 ``VLLM_DS41_MOE_BACKEND`` = skinny | turbomind; ``VLLM_DS41_MOE_DECODE_GEMV`` (default 1);
 ``VLLM_DS41_MOE_TOPK_CHECK`` (default 0: all-gathers a router-id checksum across TP each step and asserts
-equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager).
+equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager);
+``VLLM_DS41_MOE_ROUTE_HIST`` = directory (default unset: off): TP rank 0 counts the router's expert ids per layer and
+rewrites ``layer<L>.npy`` = int64 [2, n_experts] (row 0 all tokens, row 1 decode steps, T <= 8) after every
+forward. The input for a ranked expert spill (§5.2); it syncs the host each step, so measure speed without it.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import math
+import os
 from collections.abc import Iterator
 
 import numpy as np
@@ -38,15 +42,20 @@ from torch.nn import Parameter
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import (get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size, get_tp_group,
+                              tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig, FusedMoEMethodBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common import contracts as C
+from vllm.models.deepseek_v41.sm70 import fixed_m
 
 from . import gemv as v41_gemv
 from . import moe_kernels as mk
+from .moe_exl3 import DeepseekV41Exl3MoEMethod, expert_layer_context, plan_path
+from .moe_exl3 import _LAYER as _EXL3_LAYER
 from .moe_method import DeepseekV41Mxfp4MoEMethod, ExpertSpillPlan, make_spill_plan
 
 __all__ = ["DeepseekV41MoE", "ExpertSpillPlan", "make_spill_plan", "make_v41_moe_method", "expert_spill_context"]
@@ -55,6 +64,7 @@ IMPL_KNOB = "VLLM_DS41_MOE_IMPL"
 BACKEND_KNOB = "VLLM_DS41_MOE_BACKEND"
 DECODE_GEMV_KNOB = "VLLM_DS41_MOE_DECODE_GEMV"
 TOPK_CHECK_KNOB = "VLLM_DS41_MOE_TOPK_CHECK"
+ROUTE_HIST_KNOB = "VLLM_DS41_MOE_ROUTE_HIST"
 _GATE_TARGET_MAX = 32768.0  # largest |W| * 2^e kept in FP16 (half the FP16 range, leaves headroom)
 
 _SPILL: contextvars.ContextVar[ExpertSpillPlan | None] = contextvars.ContextVar("ds41_moe_spill", default=None)
@@ -75,8 +85,30 @@ def _impl() -> str:
     return knobs.env_str(IMPL_KNOB, "sm70", choices=("sm70", "torch"))
 
 
+_EXL3_ENABLED: contextvars.ContextVar[bool] = contextvars.ContextVar("ds41_moe_exl3_enabled", default=True)
+
+
+@contextlib.contextmanager
+def exl3_context(enabled: bool) -> Iterator[None]:
+    """exl3=False builds the FusedMoE with the official MXFP4 experts even when the EXL3 plan is set (the DSpark
+    drafter's 128-expert blocks are not in the plan)."""
+    token = _EXL3_ENABLED.set(enabled)
+    try:
+        yield
+    finally:
+        _EXL3_ENABLED.reset(token)
+
+
 def make_v41_moe_method(moe: FusedMoEConfig) -> FusedMoEMethodBase:
     """Factory used by DeepseekV41FP8Config for every FusedMoE of the model (backbone and DSpark)."""
+    exl3 = plan_path() if _EXL3_ENABLED.get() else ""
+    if exl3:   # routed experts from an EXL3 checkpoint (moe_exl3.py): whole experts in VRAM, no spill
+        if _SPILL.get() is not None:
+            raise ValueError("VLLM_DS41_MOE_EXL3_PLAN is set: EXL3 experts stay in VRAM, unset the expert spill")
+        layer_id = _EXL3_LAYER.get()
+        if layer_id is None:
+            raise RuntimeError("EXL3 experts need the decoder layer id (build FusedMoE inside expert_layer_context)")
+        return DeepseekV41Exl3MoEMethod(moe, layer_id, exl3)
     backend = "torch" if _impl() == "torch" else knobs.env_str(BACKEND_KNOB, "skinny",
                                                                  choices=("skinny", "turbomind"))
     return DeepseekV41Mxfp4MoEMethod(moe, backend=backend, spill=_SPILL.get())
@@ -132,7 +164,7 @@ class DeepseekV41SharedExpert(nn.Module):
 
 class DeepseekV41MoE(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str, layer_id: int, *, n_routed_experts: int = 384,
-                 top_k: int = 6, spill: ExpertSpillPlan | None = None) -> None:
+                 top_k: int = 6, spill: ExpertSpillPlan | None = None, exl3: bool = True) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.layer_id = layer_id
@@ -161,16 +193,20 @@ class DeepseekV41MoE(nn.Module):
         self.decode_gemv = knobs.env_bool(DECODE_GEMV_KNOB, True)
         self.topk_check = knobs.env_bool(TOPK_CHECK_KNOB, False)
         self.tp_size = get_tensor_model_parallel_world_size()
+        hist_dir = knobs.env_str(ROUTE_HIST_KNOB, "")
+        self.route_hist_path = (os.path.join(hist_dir, f"layer{layer_id:02d}.npy")
+                                if hist_dir and get_tensor_model_parallel_rank() == 0 else None)
+        self.route_hist = np.zeros((2, self.n_experts), dtype=np.int64)
         quant_config = vllm_config.quant_config
         self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
-        with expert_spill_context(spill):
+        with expert_spill_context(spill), expert_layer_context(layer_id), exl3_context(exl3):
             self.experts = FusedMoE(
                 num_experts=self.n_experts, top_k=self.top_k, hidden_size=self.hidden,
                 intermediate_size=int(config.moe_intermediate_size), params_dtype=torch.float16, renormalize=True,
                 quant_config=quant_config, prefix=f"{prefix}.experts", scoring_func="sqrtsoftplus",
                 routed_scaling_factor=self.routed_scale, e_score_correction_bias=self.gate.e_score_correction_bias,
                 swiglu_limit=self.swiglu_limit, router_logits_dtype=torch.float32)
-        if not isinstance(self.experts.quant_method, DeepseekV41Mxfp4MoEMethod):
+        if not isinstance(self.experts.quant_method, (DeepseekV41Mxfp4MoEMethod, DeepseekV41Exl3MoEMethod)):
             raise TypeError(f"{prefix}.experts got {type(self.experts.quant_method).__name__}; the quant config must "
                             "route DeepSeek-V4.1 FusedMoE layers to make_v41_moe_method")
         self.shared_experts = DeepseekV41SharedExpert(self.hidden, int(config.moe_intermediate_size), quant_config,
@@ -194,7 +230,7 @@ class DeepseekV41MoE(nn.Module):
             return x.float() @ self.gate.true_weight_fp32().t()
         if self.decode_gemv and x.shape[0] <= v41_gemv.MAX_GEMV_ROWS:
             return v41_gemv.gemv(x, self.gate.weight, alpha=alpha)
-        return torch.mm(x, self.gate.weight.t(), out_dtype=torch.float32).mul_(alpha)
+        return fixed_m.mm(x, self.gate.weight.t(), out_dtype=torch.float32).mul_(alpha)
 
     def route(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """FP32 logits [T, E] -> (weights [T, k] f32, ids [T, k] int32)."""
@@ -223,24 +259,56 @@ class DeepseekV41MoE(nn.Module):
         if self.decode_gemv and x.shape[0] <= v41_gemv.MAX_GEMV_ROWS:
             act = v41_gemv.gate_up_swiglu(x, w13, self.swiglu_limit)
             return v41_gemv.down_combine(act, w2, y_slots, topk_w)
-        h = torch.mm(x, w13.t(), out_dtype=torch.float32).half()
-        shared = torch.mm(mk.swiglu_fp32(h, self.swiglu_limit), w2.t(), out_dtype=torch.float32)
+        h = fixed_m.mm(x, w13.t(), out_dtype=torch.float32).half()
+        shared = fixed_m.mm(mk.swiglu_fp32(h, self.swiglu_limit), w2.t(), out_dtype=torch.float32)
         return mk.combine_fp32(y_slots, topk_w, shared)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
+        """``reduce=False`` (sequence-parallel HC, sm70/sp_hc.py): this rank's un-reduced fp32 partial."""
         if x.dtype != torch.float16 or x.ndim != 2 or x.shape[1] != self.hidden:
             raise TypeError(f"DeepseekV41MoE expects fp16 [T, {self.hidden}], got {x.dtype} {tuple(x.shape)}")
         x = x.contiguous()
         if x.shape[0] == 0:
             return x.new_empty((0, self.hidden), dtype=torch.float32)
+        rt = self.rank_timer
+        if rt is not None:
+            rt.begin(x.shape[0])
         topk_w, topk_ids = self.route(self.gate_logits(x))
         if self.topk_check and self.tp_size > 1:
             self._check_topk_consistent(topk_ids)
+        if self.route_hist_path is not None:
+            self._record_routes(topk_ids)
         y_slots = self.method.expert_slots(self.experts, x, topk_ids)
         out = self.shared_and_combine(x, y_slots, topk_w)
-        if self.tp_size > 1:
+        if rt is not None:
+            rt.mark("experts")
+        if self.tp_size > 1 and reduce:
             out = tensor_model_parallel_all_reduce(out)
+            if rt is not None:
+                rt.mark("ar")
+        if rt is not None:
+            rt.end()
         return out
+
+    @property
+    def rank_timer(self):
+        """VLLM_DS41_MOE_RANK_TIMING=N: per-TP-rank CUDA-event timing of this layer's expert compute and its
+        all-reduce (every rank logs; the rank whose 'ar' is smallest arrives last). Built on first use, None when off."""
+        t = self.__dict__.get("_rank_timer", False)
+        if t is False:
+            every = knobs.env_int(MOE_RANK_TIMING_ENV, 0, minimum=0)
+            t = MoERankTimer(self.layer_id, every) if every and torch.cuda.is_available() else None
+            self.__dict__["_rank_timer"] = t
+        return t
+
+    def _record_routes(self, topk_ids: torch.Tensor) -> None:
+        counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=self.n_experts).cpu().numpy()
+        self.route_hist[0] += counts
+        if topk_ids.shape[0] <= 8:
+            self.route_hist[1] += counts
+        tmp = f"{self.route_hist_path}.tmp.npy"
+        np.save(tmp, self.route_hist)
+        os.replace(tmp, self.route_hist_path)
 
     def _check_topk_consistent(self, topk_ids: torch.Tensor) -> None:
         if torch.cuda.is_current_stream_capturing():
@@ -252,6 +320,70 @@ class DeepseekV41MoE(nn.Module):
         if not bool((gathered == gathered[0]).all().item()):
             raise RuntimeError(f"DeepseekV41MoE layer {self.layer_id}: router ids differ across TP ranks "
                                f"(checksums {gathered.tolist()}); TP-replicated inputs must be bitwise equal (§4.1)")
+
+
+logger = init_logger(__name__)
+MOE_RANK_TIMING_ENV = "VLLM_DS41_MOE_RANK_TIMING"
+
+
+class MoERankTimer:
+    """Per-rank, per-layer timing of the MoE forward (experts incl. router + shared; the TP all-reduce). CUDA events
+    only, polled without synchronizing; logs one line per rank every ``every`` prefill-sized calls (T > 16):
+    ``DS41 moe rank timing layer L tp_rank r (n calls, mean T): experts p50/p90 ms, ar p50/p90 ms``."""
+
+    def __init__(self, layer_id: int, every: int) -> None:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        self.layer_id, self.every = layer_id, int(every)
+        self.rank = get_tensor_model_parallel_rank()
+        self.cur: dict | None = None
+        self.pending: list[dict] = []
+        self.done: list[dict] = []
+
+    @staticmethod
+    def _ev():
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
+    def begin(self, T: int) -> None:
+        self.cur = None
+        if T <= 16 or torch.cuda.is_current_stream_capturing() or len(self.pending) > 64:
+            return
+        self.cur = {"T": T, "ev": [("begin", self._ev())]}
+
+    def mark(self, name: str) -> None:
+        if self.cur is not None:
+            self.cur["ev"].append((name, self._ev()))
+
+    def end(self) -> None:
+        cur, self.cur = self.cur, None
+        if cur is None:
+            return
+        self.pending.append(cur)
+        keep = []
+        for rec in self.pending:
+            if not rec["ev"][-1][1].query():
+                keep.append(rec)
+                continue
+            ms, prev = {}, rec["ev"][0][1]
+            for name, ev in rec["ev"][1:]:
+                ms[name] = prev.elapsed_time(ev)
+                prev = ev
+            self.done.append({"T": rec["T"], **ms})
+        self.pending = keep
+        if len(self.done) >= self.every:
+            self._emit()
+
+    def _emit(self) -> None:
+        def pct(name, q):
+            xs = sorted(d.get(name, 0.0) for d in self.done)
+            return xs[min(len(xs) - 1, int(round(q * (len(xs) - 1))))]
+        n = len(self.done)
+        logger.info("DS41 moe rank timing layer %d tp_rank %d (%d calls, mean T %.0f): experts %.2f/%.2f ms, "
+                    "ar %.2f/%.2f ms", self.layer_id, self.rank, n, sum(d["T"] for d in self.done) / n,
+                    pct("experts", 0.5), pct("experts", 0.9), pct("ar", 0.5), pct("ar", 0.9))
+        self.done = []
 
 
 def spill_plan_from_ranking(num_spilled_per_layer: int, counts: np.ndarray) -> ExpertSpillPlan:
