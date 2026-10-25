@@ -69,6 +69,7 @@ class _Chunk:
     parts: int = -1            # attention parts of the current layer (-1 = not decided yet, 0 = no split)
     attn_done: bool = False    # every attention part ran: the layer's MoE part is next
     s1_started: bool = False   # a stage-1 directive of the chunk was emitted
+    prefix_token_ids: tuple[int, ...] = ()   # unseen request staged at start > 0 (prefix-cache hit): ids [0, start)
 
     @property
     def end(self) -> int:
@@ -220,6 +221,7 @@ class SlicePlanner:
         self.in_flight: dict[str, deque[_Chunk]] = {}         # per request, oldest first
         self.next_chunk_id: dict[str, int] = {}
         self.unseen: set[str] = set()                         # staged from waiting, never sent to the workers
+        self.prefix_sent: set[str] = set()                    # unseen requests whose cached prefix ids were emitted
         self.pending_blocks: dict[str, KVCacheBlocks] = {}    # seen requests: blocks allocated at staging
         self.pending_aborts: list[tuple[str, int]] = []
         self.normal_ok: set[str] = set()                      # fresh prompts whose rest is final after prefix hits
@@ -286,6 +288,8 @@ class SlicePlanner:
         self.next_chunk_id[rid] = cid + 1
         chunk = _Chunk(rid, cid, start, num_tokens, tuple(request.all_token_ids[start:start + num_tokens]),
                        request.num_tokens)
+        if unseen and start > 0 and rid not in self.prefix_sent:
+            chunk.prefix_token_ids = tuple(request.all_token_ids[:start])
         self.in_flight.setdefault(rid, deque()).append(chunk)
         self.s0 = chunk
         if unseen:
@@ -451,12 +455,15 @@ class SlicePlanner:
                    last: bool, layer_part: int = PART_WHOLE, part_index: int = 0, part_count: int = 1,
                    layer_after: int) -> SliceDirective:
         chunk.layer = layer_after
+        if stage == 0 and first and chunk.prefix_token_ids:
+            self.prefix_sent.add(chunk.req_id)
         block_ids = kv_cache_manager.get_block_ids_for_computed_tokens(chunk.req_id, chunk.end)
         return SliceDirective(
             stage=stage, req_id=chunk.req_id, chunk_id=chunk.chunk_id, start_pos=chunk.start,
             num_tokens=chunk.num_tokens, token_ids=chunk.token_ids if stage == 0 else (),
             block_ids=tuple(tuple(g) for g in block_ids), layer_start=a, layer_end=b, first=first, last=last,
-            n_req=chunk.n_req, layer_part=layer_part, part_index=part_index, part_count=part_count)
+            n_req=chunk.n_req, layer_part=layer_part, part_index=part_index, part_count=part_count,
+            prefix_token_ids=chunk.prefix_token_ids if stage == 0 and first else ())
 
     def _commit(self, kv_cache_manager: KVCacheManager, chunk: _Chunk, stage: int, a: int, b: int,
                 carry: float) -> SliceDirective:
@@ -465,6 +472,8 @@ class SlicePlanner:
             self.policy.carry[stage] = carry
             self._budget[stage] -= self.policy.cost(stage, b - a, a == lo)
         chunk.layer = b
+        if stage == 0 and a == lo and chunk.prefix_token_ids:
+            self.prefix_sent.add(chunk.req_id)
         block_ids = kv_cache_manager.get_block_ids_for_computed_tokens(chunk.req_id, chunk.end)
         return SliceDirective(
             stage=stage,
@@ -479,6 +488,7 @@ class SlicePlanner:
             first=a == lo,
             last=b == hi,
             n_req=chunk.n_req,
+            prefix_token_ids=chunk.prefix_token_ids if stage == 0 and a == lo else (),
         )
 
     def observe(self, slice_ms=(), decode_ms=()) -> None:
@@ -538,6 +548,7 @@ class SlicePlanner:
         self.drop_request(req_id, "finish")
         self.next_chunk_id.pop(req_id, None)
         self.normal_ok.discard(req_id)
+        self.prefix_sent.discard(req_id)
 
     def take_aborts(self) -> tuple[tuple[str, int], ...]:
         out, self.pending_aborts = tuple(self.pending_aborts), []

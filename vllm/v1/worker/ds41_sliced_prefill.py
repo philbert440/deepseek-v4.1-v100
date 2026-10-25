@@ -828,8 +828,12 @@ class SlicedPrefillExecutor:
         svc = getattr(self.model, "engram_service", None)
         if svc is not None and self.engram_layers:
             ids = np.asarray(d.token_ids, dtype=np.int32)
+            prefix = np.asarray(d.prefix_token_ids, dtype=np.int32) if d.prefix_token_ids else None
             st.engram_service = svc
-            st.engram_handle = svc.begin_slice(d.req_id, s, T, num_tokens_padded=T, token_ids=ids)
+            st.engram_handle = svc.begin_slice(d.req_id, s, T, prompt_token_ids=prefix, num_tokens_padded=T,
+                                               token_ids=ids)
+        if self.on_staged is not None and d.prefix_token_ids:
+            self.on_staged(d.req_id, 0, np.asarray(d.prefix_token_ids, dtype=np.int32))
         if self.on_staged is not None and len(d.token_ids):
             self.on_staged(d.req_id, s, np.asarray(d.token_ids, dtype=np.int32))
         if self.verify and st.verify_ref is not None:

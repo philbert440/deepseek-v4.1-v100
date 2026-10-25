@@ -189,6 +189,9 @@ class SliceDirective:
     layer_part: int = PART_WHOLE   # PART_WHOLE | PART_ATTN | PART_MOE
     part_index: int = 0            # PART_ATTN: this part (0 = first: KV / compressor stores; last: attend + wo + hc)
     part_count: int = 1            # PART_ATTN: number of attention parts of the layer
+    # stage-0 first slice of a request the workers have never seen whose first chunk starts after a prefix-cache hit:
+    # token ids [0, start_pos), so the Engram history (hashed n-grams reach back before the chunk) exists; () otherwise
+    prefix_token_ids: tuple[int, ...] = ()
 
     @property
     def key(self) -> tuple[str, int]:

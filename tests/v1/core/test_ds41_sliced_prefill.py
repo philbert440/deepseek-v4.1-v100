@@ -561,6 +561,18 @@ def test_prefix_cache_hit_and_late_hash(monkeypatch):
     q_starts = [d.start_pos for s in ex.slice_steps for d in s if d.req_id == "q" and d.first and d.stage == 0]
     q_starts += [n.num_computed_tokens for so in ex.so_log for n in so.scheduled_new_reqs if n.req_id == "q"]
     assert ex.done_end["p"] > 0 and min(q_starts) > 0          # q's first chunk started after a cache hit
+    # q was staged unseen after the hit: its first stage-0 slice carries the cached prefix ids (Engram history),
+    # exactly once, and every other directive carries none
+    q_dirs = [d for s in ex.slice_steps for d in s if d.req_id == "q"]
+    with_prefix = [d for d in q_dirs if d.prefix_token_ids]
+    if q_dirs and q_dirs[0].start_pos > 0:
+        assert len(with_prefix) == 1 and with_prefix[0] is q_dirs[0] and with_prefix[0].stage == 0
+        assert with_prefix[0].prefix_token_ids == tuple(ex.seq["q"][:q_dirs[0].start_pos])
+    for rid in {d.req_id for s in ex.slice_steps for d in s}:     # any request: exact prefix, first slice only
+        ds = [d for s in ex.slice_steps for d in s if d.req_id == rid]
+        for d in (d for d in ds if d.prefix_token_ids):
+            assert d is ds[0] and d.stage == 0 and d.first and d.start_pos > 0
+            assert d.prefix_token_ids == tuple(ex.seq[rid][:d.start_pos])
 
 
 def test_planner_stale_done_is_ignored():

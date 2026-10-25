@@ -284,6 +284,12 @@ def test_slice_chunk_token_ids(syn: SyntheticEngram, monkeypatch: pytest.MonkeyP
             svc.begin_slice("B", 100, 50, token_ids=p[100:150])
         with pytest.raises(KeyError, match="without token history"):
             svc.begin_slice("C", 64, 32, token_ids=p[64:96])
+        # unseen request after a prefix-cache hit: the cached prefix ids build the history, the chunk extends it
+        orc.set("D", 0, p)
+        h = svc.begin_slice("D", 300, 100, prompt_token_ids=p[:300], token_ids=p[300:400])
+        got = {lid: slice_rows(svc, h, lid, 100) for lid in (1, 14)}
+        svc.end_slice(h)
+        check(orc, got, [("D", 300, 100)], 100)
         with pytest.raises(ValueError, match="token_ids"):
             svc.begin_slice("C", 0, 32, token_ids=p[:31])
     finally:
