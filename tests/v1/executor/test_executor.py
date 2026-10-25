@@ -1,0 +1,243 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import asyncio
+import os
+from collections.abc import Callable
+from concurrent.futures import Future
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.executor import uniproc_executor as uniproc_executor_module
+from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.uniproc_executor import (
+    ExecutorWithExternalLauncher,
+    UniProcExecutor,
+)
+
+
+class Mock: ...
+
+
+def test_supports_async_scheduling_base_executor():
+    assert Executor.supports_async_scheduling() is False
+
+
+def test_supports_async_scheduling_uniproc_executor():
+    assert UniProcExecutor.supports_async_scheduling() is True
+
+
+def test_supports_async_scheduling_executor_with_external_launcher():
+    # ExecutorWithExternalLauncher inherits from UniProcExecutor and does not
+    # override supports_async_scheduling, so it should return True.
+    assert ExecutorWithExternalLauncher.supports_async_scheduling() is True
+
+
+def test_supports_async_scheduling_multiproc_executor():
+    assert MultiprocExecutor.supports_async_scheduling() is True
+
+
+def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
+    """TP1 must not silently wait for a PLE process that was never spawned."""
+    driver_worker = MagicMock()
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "WorkerWrapperBase",
+        MagicMock(return_value=driver_worker),
+    )
+    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        False,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
+        False,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "set_worker_net_device",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
+
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.vllm_config = object()
+    monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
+
+    executor._init_executor()
+
+    assert [call[0] for call in driver_worker.method_calls] == [
+        "init_worker",
+        "init_device",
+        "spawn_ple_offload",
+        "load_model",
+        "wait_ple_offload_ready",
+    ]
+
+
+def test_uniproc_executor_delays_hybrid_ple_spawn(monkeypatch):
+    driver_worker = MagicMock()
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "WorkerWrapperBase",
+        MagicMock(return_value=driver_worker),
+    )
+    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        True,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
+        False,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "set_worker_net_device",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
+
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.vllm_config = object()
+    monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
+
+    executor._init_executor()
+
+    assert [call[0] for call in driver_worker.method_calls] == [
+        "init_worker",
+        "init_device",
+        "prepare_ple_offload_spawn",
+        "load_model",
+        "spawn_ple_offload",
+        "wait_ple_offload_ready",
+    ]
+
+
+class CustomMultiprocExecutor(MultiprocExecutor):
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: KVOutputAggregator = None,
+    ) -> Any | list[Any] | Future[Any | list[Any]]:
+        # Drop marker to show that this was run
+        with open(".marker", "w"):
+            ...
+        return super().collective_rpc(
+            method,
+            timeout,
+            args,
+            kwargs,
+            non_block,
+            unique_reply_rank,
+            kv_output_aggregator,
+        )
+
+
+CustomMultiprocExecutorAsync = CustomMultiprocExecutor
+MODEL = "Qwen/Qwen3-0.6B"
+
+
+def test_custom_executor_type_checking():
+    with pytest.raises(ValueError):
+        engine_args = EngineArgs(
+            model=MODEL,
+            gpu_memory_utilization=0.2,
+            max_model_len=8192,
+            distributed_executor_backend=Mock,
+        )
+        LLMEngine.from_engine_args(engine_args)
+    with pytest.raises(ValueError):
+        engine_args = AsyncEngineArgs(
+            model=MODEL,
+            gpu_memory_utilization=0.2,
+            max_model_len=8192,
+            distributed_executor_backend=Mock,
+        )
+        AsyncLLM.from_engine_args(engine_args)
+
+
+@pytest.mark.parametrize(
+    "distributed_executor_backend",
+    [
+        CustomMultiprocExecutor,
+        "tests.v1.executor.test_executor.CustomMultiprocExecutor",
+    ],
+)
+def test_custom_executor(distributed_executor_backend, tmp_path):
+    cwd = os.path.abspath(".")
+    os.chdir(tmp_path)
+    try:
+        assert not os.path.exists(".marker")
+
+        engine_args = EngineArgs(
+            model=MODEL,
+            gpu_memory_utilization=0.2,
+            max_model_len=8192,
+            distributed_executor_backend=distributed_executor_backend,
+            enforce_eager=True,  # reduce test time
+        )
+        engine = LLMEngine.from_engine_args(engine_args)
+        sampling_params = SamplingParams(max_tokens=1)
+
+        engine.add_request("0", "foo", sampling_params)
+        engine.step()
+
+        assert os.path.exists(".marker")
+    finally:
+        os.chdir(cwd)
+
+
+@pytest.mark.parametrize(
+    "distributed_executor_backend",
+    [
+        CustomMultiprocExecutorAsync,
+        "tests.v1.executor.test_executor.CustomMultiprocExecutorAsync",
+    ],
+)
+def test_custom_executor_async(distributed_executor_backend, tmp_path):
+    cwd = os.path.abspath(".")
+    os.chdir(tmp_path)
+    try:
+        assert not os.path.exists(".marker")
+
+        engine_args = AsyncEngineArgs(
+            model=MODEL,
+            gpu_memory_utilization=0.2,
+            max_model_len=8192,
+            distributed_executor_backend=distributed_executor_backend,
+            enforce_eager=True,  # reduce test time
+        )
+        engine = AsyncLLM.from_engine_args(engine_args)
+        sampling_params = SamplingParams(max_tokens=1)
+
+        async def t():
+            stream = engine.generate(
+                request_id="0", prompt="foo", sampling_params=sampling_params
+            )
+            async for x in stream:
+                ...
+
+        asyncio.run(t())
+
+        assert os.path.exists(".marker")
+    finally:
+        os.chdir(cwd)

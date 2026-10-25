@@ -1,0 +1,704 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import os
+from unittest.mock import patch
+
+import pytest
+
+import vllm.envs as envs
+from vllm.envs import (
+    disable_envs_cache,
+    enable_envs_cache,
+    env_list_with_choices,
+    env_set_with_choices,
+    env_with_choices,
+    environment_variables,
+)
+
+
+def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
+    assert envs.VLLM_HOST_IP == ""
+    assert envs.VLLM_PORT is None
+    monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
+    monkeypatch.setenv("VLLM_PORT", "1234")
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+    assert envs.VLLM_PORT == 1234
+    # __getattr__ is not decorated with functools.cache
+    assert not hasattr(envs.__getattr__, "cache_info")
+
+
+def test_nixl_side_channel_host_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_HOST", "10.0.0.15")
+
+    assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
+
+
+def test_unregistered_vllm_env_vars_are_compile_factors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An out-of-tree kernel switch must change the compile cache key.
+
+    Forks and plugins read their own VLLM_-prefixed variables straight from
+    os.environ, so this module never declares them. They still select
+    kernels, so a compiled artifact from one route must not be reused for
+    another.
+    """
+    monkeypatch.delenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", raising=False)
+    baseline = envs.compile_factors()
+    assert "VLLM_OUT_OF_TREE_KERNEL_ROUTE" not in baseline
+
+    monkeypatch.setenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", "qpn")
+    with_switch = envs.compile_factors()
+    assert with_switch["VLLM_OUT_OF_TREE_KERNEL_ROUTE"] == "qpn"
+    assert with_switch != baseline
+
+    monkeypatch.setenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", "marlin")
+    assert envs.compile_factors() != with_switch
+
+
+def test_ignored_factors_stay_out_even_when_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The ignore list wins over the out-of-tree sweep."""
+    monkeypatch.setenv("VLLM_PORT", "1234")
+    monkeypatch.setenv("VLLM_CACHE_ROOT", "/tmp/some-cache")
+
+    factors = envs.compile_factors()
+    assert "VLLM_PORT" not in factors
+    assert "VLLM_CACHE_ROOT" not in factors
+
+
+def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
+    monkeypatch.setenv("VLLM_PORT", "1234")
+    # __getattr__ is not decorated with functools.cache
+    assert not hasattr(envs.__getattr__, "cache_info")
+
+    # Enable envs cache and ignore ongoing environment changes
+    enable_envs_cache()
+
+    # __getattr__ is decorated with functools.cache
+    assert hasattr(envs.__getattr__, "cache_info")
+    start_hits = envs.__getattr__.cache_info().hits
+
+    # 2 more hits due to VLLM_HOST_IP and VLLM_PORT accesses
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+    assert envs.VLLM_PORT == 1234
+    assert envs.__getattr__.cache_info().hits == start_hits + 2
+
+    # All environment variables are cached
+    for environment_variable in environment_variables:
+        envs.__getattr__(environment_variable)
+    assert envs.__getattr__.cache_info().hits == start_hits + 2 + len(
+        environment_variables
+    )
+
+    # Reset envs.__getattr__ back to none-cached version to
+    # avoid affecting other tests
+    envs.__getattr__ = envs.__getattr__.__wrapped__
+
+
+def test_getattr_with_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
+    # __getattr__ is not decorated with functools.cache
+    assert not hasattr(envs.__getattr__, "cache_info")
+
+    # Enable envs cache and ignore ongoing environment changes
+    enable_envs_cache()
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+    # With cache enabled, the environment variable value is cached and unchanged
+    monkeypatch.setenv("VLLM_HOST_IP", "2.2.2.2")
+    assert envs.VLLM_HOST_IP == "1.1.1.1"
+
+    disable_envs_cache()
+    assert envs.VLLM_HOST_IP == "2.2.2.2"
+    # After cache disabled, the environment variable value would be synced
+    # with os.environ
+    monkeypatch.setenv("VLLM_HOST_IP", "3.3.3.3")
+    assert envs.VLLM_HOST_IP == "3.3.3.3"
+
+
+def test_is_envs_cache_enabled() -> None:
+    assert not envs._is_envs_cache_enabled()
+    enable_envs_cache()
+    assert envs._is_envs_cache_enabled()
+
+    # Only wrap one-layer of cache, so we only need to
+    # call disable once to reset.
+    enable_envs_cache()
+    enable_envs_cache()
+    enable_envs_cache()
+    disable_envs_cache()
+    assert not envs._is_envs_cache_enabled()
+
+    disable_envs_cache()
+    assert not envs._is_envs_cache_enabled()
+
+
+def test_precompiled_install_flags_are_orthogonal() -> None:
+    # The Rust frontend flag must not implicitly enable the precompiled C
+    # extensions.
+    with patch.dict(os.environ, {"VLLM_USE_PRECOMPILED_RUST": "1"}, clear=True):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is False
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+    # A wheel location still selects precompiled C extensions without
+    # implicitly enabling the Rust frontend.
+    with patch.dict(
+        os.environ,
+        {"VLLM_PRECOMPILED_WHEEL_LOCATION": "/tmp/vllm.whl"},
+        clear=True,
+    ):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is False
+
+
+def test_sm70_concurrency_tuning_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults = {
+        "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": False,
+        "VLLM_SM70_TOPK_TOPP_8_WARPS": False,
+        "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": True,
+    }
+    for name, default in defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is default
+        monkeypatch.setenv(name, "1")
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
+
+    for name in (
+        "VLLM_SM70_FP8_QPN8_M16",
+        "VLLM_SM70_FP8_QPN8_M32_CHUNKED",
+        "VLLM_SM70_FP8_QPN8_M32_NATIVE",
+        "VLLM_SM70_NVFP4_QPN2_M16_NATIVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_MTP_MOE_TUNED_CONFIG"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_FP8_PRESCALED_M1_DECODE"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    name = "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
+    for name in (
+        "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE",
+        "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE",
+        "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", raising=False)
+    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 128
+    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
+    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 640
+
+
+def test_flash_v100_g6_sawtooth_pipeline_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bool_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": True,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": True,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": False,
+    }
+    int_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": 111104,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": 147841,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": 258176,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": 8,
+    }
+
+    for name, expected_bool in bool_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is expected_bool
+        monkeypatch.setenv(name, "0" if expected_bool else "1")
+        assert environment_variables[name]() is not expected_bool
+
+    for name, expected_int in int_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() == expected_int
+        monkeypatch.setenv(name, str(expected_int + 1))
+        assert environment_variables[name]() == expected_int + 1
+
+
+def test_flash_v100_e4m3_page800_fastpath_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bool_defaults = {
+        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": True,
+        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": False,
+    }
+    for name, expected_bool in bool_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is expected_bool
+        monkeypatch.setenv(name, "0" if expected_bool else "1")
+        assert environment_variables[name]() is not expected_bool
+
+
+def test_flash_v100_dflash2_grouped_layout_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED",
+        "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
+
+
+class TestEnvWithChoices:
+    """Test cases for env_with_choices function."""
+
+    def test_default_value_returned_when_env_not_set(self):
+        """Test default is returned when env var is not set."""
+        env_func = env_with_choices(
+            "NONEXISTENT_ENV", "default", ["option1", "option2"]
+        )
+        assert env_func() == "default"
+
+    def test_none_default_returned_when_env_not_set(self):
+        """Test that None is returned when env not set and default is None."""
+        env_func = env_with_choices("NONEXISTENT_ENV", None, ["option1", "option2"])
+        assert env_func() is None
+
+    def test_valid_value_returned_case_sensitive(self):
+        """Test that valid value is returned in case sensitive mode."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["option1", "option2"], case_sensitive=True
+            )
+            assert env_func() == "option1"
+
+    def test_valid_lowercase_value_returned_case_insensitive(self):
+        """Test that lowercase value is accepted in case insensitive mode."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["OPTION1", "OPTION2"], case_sensitive=False
+            )
+            assert env_func() == "option1"
+
+    def test_valid_uppercase_value_returned_case_insensitive(self):
+        """Test that uppercase value is accepted in case insensitive mode."""
+        with patch.dict(os.environ, {"TEST_ENV": "OPTION1"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["option1", "option2"], case_sensitive=False
+            )
+            assert env_func() == "OPTION1"
+
+    def test_invalid_value_raises_error_case_sensitive(self):
+        """Test that invalid value raises ValueError in case sensitive mode."""
+        with patch.dict(os.environ, {"TEST_ENV": "invalid"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["option1", "option2"], case_sensitive=True
+            )
+            with pytest.raises(
+                ValueError, match="Invalid value 'invalid' for TEST_ENV"
+            ):
+                env_func()
+
+    def test_case_mismatch_raises_error_case_sensitive(self):
+        """Test that case mismatch raises ValueError in case sensitive mode."""
+        with patch.dict(os.environ, {"TEST_ENV": "OPTION1"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["option1", "option2"], case_sensitive=True
+            )
+            with pytest.raises(
+                ValueError, match="Invalid value 'OPTION1' for TEST_ENV"
+            ):
+                env_func()
+
+    def test_invalid_value_raises_error_case_insensitive(self):
+        """Test that invalid value raises ValueError when case insensitive."""
+        with patch.dict(os.environ, {"TEST_ENV": "invalid"}):
+            env_func = env_with_choices(
+                "TEST_ENV", "default", ["option1", "option2"], case_sensitive=False
+            )
+            with pytest.raises(
+                ValueError, match="Invalid value 'invalid' for TEST_ENV"
+            ):
+                env_func()
+
+    def test_callable_choices_resolved_correctly(self):
+        """Test that callable choices are resolved correctly."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "dynamic1"}):
+            env_func = env_with_choices("TEST_ENV", "default", get_choices)
+            assert env_func() == "dynamic1"
+
+    def test_callable_choices_with_invalid_value(self):
+        """Test that callable choices raise error for invalid values."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "invalid"}):
+            env_func = env_with_choices("TEST_ENV", "default", get_choices)
+            with pytest.raises(
+                ValueError, match="Invalid value 'invalid' for TEST_ENV"
+            ):
+                env_func()
+
+
+class TestEnvListWithChoices:
+    """Test cases for env_list_with_choices function."""
+
+    def test_default_list_returned_when_env_not_set(self):
+        """Test that default list is returned when env var is not set."""
+        env_func = env_list_with_choices(
+            "NONEXISTENT_ENV", ["default1", "default2"], ["option1", "option2"]
+        )
+        assert env_func() == ["default1", "default2"]
+
+    def test_empty_default_list_returned_when_env_not_set(self):
+        """Test that empty default list is returned when env not set."""
+        env_func = env_list_with_choices("NONEXISTENT_ENV", [], ["option1", "option2"])
+        assert env_func() == []
+
+    def test_single_valid_value_parsed_correctly(self):
+        """Test that single valid value is parsed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1"}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == ["option1"]
+
+    def test_multiple_valid_values_parsed_correctly(self):
+        """Test that multiple valid values are parsed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,option2"}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == ["option1", "option2"]
+
+    def test_values_with_whitespace_trimmed(self):
+        """Test that values with whitespace are trimmed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": " option1 , option2 "}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == ["option1", "option2"]
+
+    def test_empty_values_filtered_out(self):
+        """Test that empty values are filtered out."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,,option2,"}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == ["option1", "option2"]
+
+    def test_empty_string_returns_default(self):
+        """Test that empty string returns default."""
+        with patch.dict(os.environ, {"TEST_ENV": ""}):
+            env_func = env_list_with_choices(
+                "TEST_ENV", ["default"], ["option1", "option2"]
+            )
+            assert env_func() == ["default"]
+
+    def test_only_commas_returns_default(self):
+        """Test that string with only commas returns default."""
+        with patch.dict(os.environ, {"TEST_ENV": ",,,"}):
+            env_func = env_list_with_choices(
+                "TEST_ENV", ["default"], ["option1", "option2"]
+            )
+            assert env_func() == ["default"]
+
+    def test_case_sensitive_validation(self):
+        """Test case sensitive validation."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,OPTION2"}):
+            env_func = env_list_with_choices(
+                "TEST_ENV", [], ["option1", "option2"], case_sensitive=True
+            )
+            with pytest.raises(ValueError, match="Invalid value 'OPTION2' in TEST_ENV"):
+                env_func()
+
+    def test_case_insensitive_validation(self):
+        """Test case insensitive validation."""
+        with patch.dict(os.environ, {"TEST_ENV": "OPTION1,option2"}):
+            env_func = env_list_with_choices(
+                "TEST_ENV", [], ["option1", "option2"], case_sensitive=False
+            )
+            assert env_func() == ["OPTION1", "option2"]
+
+    def test_invalid_value_in_list_raises_error(self):
+        """Test that invalid value in list raises ValueError."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,invalid,option2"}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            with pytest.raises(ValueError, match="Invalid value 'invalid' in TEST_ENV"):
+                env_func()
+
+    def test_callable_choices_resolved_correctly(self):
+        """Test that callable choices are resolved correctly."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "dynamic1,dynamic2"}):
+            env_func = env_list_with_choices("TEST_ENV", [], get_choices)
+            assert env_func() == ["dynamic1", "dynamic2"]
+
+    def test_callable_choices_with_invalid_value(self):
+        """Test that callable choices raise error for invalid values."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "dynamic1,invalid"}):
+            env_func = env_list_with_choices("TEST_ENV", [], get_choices)
+            with pytest.raises(ValueError, match="Invalid value 'invalid' in TEST_ENV"):
+                env_func()
+
+    def test_duplicate_values_preserved(self):
+        """Test that duplicate values in the list are preserved."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,option1,option2"}):
+            env_func = env_list_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == ["option1", "option1", "option2"]
+
+
+class TestEnvSetWithChoices:
+    """Test cases for env_set_with_choices function."""
+
+    def test_default_list_returned_when_env_not_set(self):
+        """Test that default list is returned when env var is not set."""
+        env_func = env_set_with_choices(
+            "NONEXISTENT_ENV", ["default1", "default2"], ["option1", "option2"]
+        )
+        assert env_func() == {"default1", "default2"}
+
+    def test_empty_default_list_returned_when_env_not_set(self):
+        """Test that empty default list is returned when env not set."""
+        env_func = env_set_with_choices("NONEXISTENT_ENV", [], ["option1", "option2"])
+        assert env_func() == set()
+
+    def test_single_valid_value_parsed_correctly(self):
+        """Test that single valid value is parsed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1"}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == {"option1"}
+
+    def test_multiple_valid_values_parsed_correctly(self):
+        """Test that multiple valid values are parsed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,option2"}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == {"option1", "option2"}
+
+    def test_values_with_whitespace_trimmed(self):
+        """Test that values with whitespace are trimmed correctly."""
+        with patch.dict(os.environ, {"TEST_ENV": " option1 , option2 "}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == {"option1", "option2"}
+
+    def test_empty_values_filtered_out(self):
+        """Test that empty values are filtered out."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,,option2,"}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == {"option1", "option2"}
+
+    def test_empty_string_returns_default(self):
+        """Test that empty string returns default."""
+        with patch.dict(os.environ, {"TEST_ENV": ""}):
+            env_func = env_set_with_choices(
+                "TEST_ENV", ["default"], ["option1", "option2"]
+            )
+            assert env_func() == {"default"}
+
+    def test_only_commas_returns_default(self):
+        """Test that string with only commas returns default."""
+        with patch.dict(os.environ, {"TEST_ENV": ",,,"}):
+            env_func = env_set_with_choices(
+                "TEST_ENV", ["default"], ["option1", "option2"]
+            )
+            assert env_func() == {"default"}
+
+    def test_case_sensitive_validation(self):
+        """Test case sensitive validation."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,OPTION2"}):
+            env_func = env_set_with_choices(
+                "TEST_ENV", [], ["option1", "option2"], case_sensitive=True
+            )
+            with pytest.raises(ValueError, match="Invalid value 'OPTION2' in TEST_ENV"):
+                env_func()
+
+    def test_case_insensitive_validation(self):
+        """Test case insensitive validation."""
+        with patch.dict(os.environ, {"TEST_ENV": "OPTION1,option2"}):
+            env_func = env_set_with_choices(
+                "TEST_ENV", [], ["option1", "option2"], case_sensitive=False
+            )
+            assert env_func() == {"OPTION1", "option2"}
+
+    def test_invalid_value_in_list_raises_error(self):
+        """Test that invalid value in list raises ValueError."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,invalid,option2"}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            with pytest.raises(ValueError, match="Invalid value 'invalid' in TEST_ENV"):
+                env_func()
+
+    def test_callable_choices_resolved_correctly(self):
+        """Test that callable choices are resolved correctly."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "dynamic1,dynamic2"}):
+            env_func = env_set_with_choices("TEST_ENV", [], get_choices)
+            assert env_func() == {"dynamic1", "dynamic2"}
+
+    def test_callable_choices_with_invalid_value(self):
+        """Test that callable choices raise error for invalid values."""
+
+        def get_choices():
+            return ["dynamic1", "dynamic2"]
+
+        with patch.dict(os.environ, {"TEST_ENV": "dynamic1,invalid"}):
+            env_func = env_set_with_choices("TEST_ENV", [], get_choices)
+            with pytest.raises(ValueError, match="Invalid value 'invalid' in TEST_ENV"):
+                env_func()
+
+    def test_duplicate_values_deduped(self):
+        """Test that duplicate values in the list are deduped."""
+        with patch.dict(os.environ, {"TEST_ENV": "option1,option1,option2"}):
+            env_func = env_set_with_choices("TEST_ENV", [], ["option1", "option2"])
+            assert env_func() == {"option1", "option2"}
+
+
+class TestVllmConfigureLogging:
+    """Test cases for VLLM_CONFIGURE_LOGGING environment variable."""
+
+    def test_configure_logging_defaults_to_true(self):
+        """Test that VLLM_CONFIGURE_LOGGING defaults to True when not set."""
+        # Ensure the env var is not set
+        with patch.dict(os.environ, {}, clear=False):
+            if "VLLM_CONFIGURE_LOGGING" in os.environ:
+                del os.environ["VLLM_CONFIGURE_LOGGING"]
+
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is True
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_zero_string(self):
+        """Test that VLLM_CONFIGURE_LOGGING='0' evaluates to False."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "0"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is False
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_one_string(self):
+        """Test that VLLM_CONFIGURE_LOGGING='1' evaluates to True."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "1"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            result = envs.VLLM_CONFIGURE_LOGGING
+            assert result is True
+            assert isinstance(result, bool)
+
+    def test_configure_logging_with_invalid_value_raises_error(self):
+        """Test that invalid VLLM_CONFIGURE_LOGGING value raises ValueError."""
+        with patch.dict(os.environ, {"VLLM_CONFIGURE_LOGGING": "invalid"}):
+            # Clear cache if it exists
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            with pytest.raises(ValueError, match="invalid literal for int"):
+                _ = envs.VLLM_CONFIGURE_LOGGING
+
+
+class TestVllmMaxNSequences:
+    def test_default_value(self):
+        """Test that VLLM_MAX_N_SEQUENCES defaults to 64."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_MAX_N_SEQUENCES", None)
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            assert envs.VLLM_MAX_N_SEQUENCES == 16384
+
+    def test_custom_value(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that VLLM_MAX_N_SEQUENCES can be overridden."""
+        monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "128")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        assert envs.VLLM_MAX_N_SEQUENCES == 128
+
+    def test_sampling_params_respects_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test that SamplingParams rejects n above the limit."""
+        from vllm.sampling_params import SamplingParams
+
+        monkeypatch.delenv("VLLM_MAX_N_SEQUENCES", raising=False)
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        max_n = envs.VLLM_MAX_N_SEQUENCES
+        SamplingParams(n=max_n)
+
+        with pytest.raises(ValueError, match="n must be at most"):
+            SamplingParams(n=max_n + 1)
+
+    def test_sampling_params_respects_custom_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test that SamplingParams uses the overridden env var limit."""
+        from vllm.sampling_params import SamplingParams
+
+        monkeypatch.setenv("VLLM_MAX_N_SEQUENCES", "128")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        SamplingParams(n=128)
+
+        with pytest.raises(ValueError, match="n must be at most 128"):
+            SamplingParams(n=129)

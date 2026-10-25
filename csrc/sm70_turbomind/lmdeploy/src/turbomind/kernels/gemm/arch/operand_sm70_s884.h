@@ -1,0 +1,247 @@
+// Copyright (c) OpenMMLab. All rights reserved.
+
+#pragma once
+
+#include "src/turbomind/kernels/core/layout.h"
+#include "src/turbomind/kernels/core/meta.h"
+#include "src/turbomind/kernels/gemm/arch/smem_copy_sm70.h"
+#include "src/turbomind/kernels/gemm/iterator.h"
+#include "src/turbomind/kernels/gemm/operand.h"
+#include "src/turbomind/kernels/gemm/smem_copy.h"
+#include "src/turbomind/kernels/gemm/types.h"
+
+namespace turbomind::gemm {
+
+namespace sm70_s884 {
+
+template<Order order>
+struct GetSmemLayout {
+    template<int M, int K>
+    static constexpr auto apply(pair<M, K>)
+    {
+        constexpr int2 cs = mk2cs<order>(M, K);
+        return SmemLayoutV2<cs.y, cs.x, 1, 1>{};
+    }
+};
+
+template<class T>
+struct Operand_A {
+    using Dtype = T;
+
+    static constexpr Pack  kPack  = 0;
+    static constexpr Order kOrder = kRowMajor;
+
+    using SmemCopyAtom = SmemCopy_MMA_884_A<T>;
+
+    using GetSmemLayout = GetSmemLayout<kOrder>;
+    using GetGmemIter   = GetGmemIter;
+};
+
+template<class T>
+struct Operand_A_Swizzle_8x64: Operand_A<T> {
+    struct GetSmemLayout {
+        template<int M, int K>
+        static constexpr auto apply(pair<M, K>)
+        {
+            static_assert(M == 8 && K == 64);
+            return SmemLayoutV2<M, K, M, K, Swizzle<3, 3, 3>>{};
+        }
+    };
+};
+
+// Pad each activation row by eight half values to spread accesses across
+// shared-memory banks. Weight layout and arithmetic remain unchanged.
+template<class T>
+struct Operand_A_BatchPadded: Operand_A<T> {
+    template<int C, int S, int WARPS>
+    struct PartialWarpThreadMap:
+        ThreadMap_V2<C, S, 128 / bitsof<T>, Blocked, WARPS> {
+        using Base = ThreadMap_V2<C, S, 128 / bitsof<T>, Blocked, WARPS>;
+        // M48/K32 needs six loading warps, but the GEMM has eight. The
+        // base map considers its six-warp tile aligned and does not account
+        // for the two surplus warps. Keep their row predicates active even
+        // when the logical matrix exactly fills the CTA tile.
+        static constexpr bool kAlignedS =
+            Base::kAlignedS && WARPS == Base::kWarpC * Base::kWarpS;
+    };
+
+    struct GetGmemIter {
+        template<class Operand, class Iterator, class SmemLayout, int M, int K, int WARPS>
+        static constexpr auto apply(basic_type<Operand> operand,
+                                    basic_type<Iterator> iterator,
+                                    basic_type<SmemLayout> layout,
+                                    pair<M, K> shape, constant<WARPS> warps)
+        {
+            if constexpr (M % 32 == 0) {
+                return gemm::GetGmemIter::apply(operand, iterator, layout, shape, warps);
+            }
+            else {
+                // M48 with eight warps otherwise selects a six-half access,
+                // which has no aligned CUDA vector load. Keep 16-byte A
+                // transactions and let ThreadMap predicate its partial wave.
+                using Dtype = typename Operand::Dtype;
+                constexpr int2 cs = mk2cs<Operand::kOrder>(M, K);
+                constexpr int2 aligned = mk2cs<Operand::kOrder>(0, 1);
+                using Iter = typename Iterator::template Type<
+                    Dtype, PartialWarpThreadMap<cs.x, cs.y, WARPS>,
+                    SmemLayout, Operand::kPack, Operand::kOrder, aligned.x, aligned.y>;
+                return type_c<Iter>;
+            }
+        }
+    };
+
+    template<int M, int K>
+    struct Layout: SmemLayoutV2<M, K, 1, 1> {
+        static constexpr int  kSize      = M * (K + 8);
+        static constexpr bool kIsTrivial = false;
+
+        __forceinline__ __device__ static int apply(int s, int c, int offset = 0)
+        {
+            return s * (K + 8) + c + offset;
+        }
+
+        __forceinline__ __device__ int operator()(int s, int c, int offset = 0)
+        {
+            return apply(s, c, offset);
+        }
+    };
+
+    struct GetSmemLayout {
+        template<int M, int K>
+        static constexpr auto apply(pair<M, K>)
+        {
+            return Layout<M, K>{};
+        }
+    };
+};
+
+template<class T>
+struct Operand_B {
+    using Dtype = T;
+
+    static constexpr Pack  kPack  = 0;
+    static constexpr Order kOrder = kRowMajor;  // (n,k)
+
+    using SmemCopyAtom = SmemCopy_MMA_884_B<T>;
+
+    using GetSmemLayout = GetSmemLayout<kOrder>;
+    using GetGmemIter   = GetGmemIter;
+};
+
+template<class T>
+struct Operand_V {
+    using Dtype = T;
+
+    static constexpr Pack  kPack  = 0;
+    static constexpr Order kOrder = kColMajor;  // (n,k)
+
+    using SmemCopyAtom = SmemCopy_MMA_884_V<T, 1>;
+
+    struct GetSmemLayout {  // m-major
+        template<int M, int K>
+        static constexpr auto apply(pair<M, K>)
+        {
+            return SmemLayoutV2<K, M>{};
+        }
+    };
+
+    using GetGmemIter = GetGmemIter;
+};
+
+template<Order order>
+struct _GetSmemLayoutC {
+    template<int M, int N>
+    static constexpr auto apply(pair<M, N>)
+    {
+        constexpr auto cs = mk2cs<order>(M, N);
+        return SmemLayoutV2<cs.y, cs.x, 1, 1>{};
+    }
+};
+
+template<Order order>
+struct _GetThreadMapC {
+    template<int M, int N, int THREADS>
+    static constexpr auto apply(pair<M, N>, constant<THREADS>)
+    {
+        constexpr auto cs    = mk2cs<order>(M, N);
+        constexpr int  WARPS = THREADS / WARP_SIZE;
+
+        return ThreadMap_V2<cs.x, cs.y, 4, Raked, WARPS>{};
+    }
+};
+
+template<class T, Order order>
+struct Operand_C {
+    using Dtype = T;
+
+    static constexpr Order kOrder = order;
+
+    using GetSmemLayout = _GetSmemLayoutC<order>;
+    using GetThreadMap  = _GetThreadMapC<order>;
+};
+
+template<class T>
+struct Operand_B_Pack {
+    using Dtype = T;
+
+    static constexpr int Pack_M = 1;
+
+    static constexpr Pack  kPack  = HMMA_884 | OPERAND_B | Pack_M;
+    static constexpr Order kOrder = kRowMajor;
+
+    using SmemCopyAtom = SmemCopyAtom_Pack_v3<T, SmemCopy_MMA_884_B<T>, kOrder, Pack_M>;
+
+    using GetSmemLayout = GetSmemLayout<kOrder>;
+    using GetGmemIter   = GetGmemIter;
+};
+
+template<class T>
+struct Operand_V_Pack {
+    using Dtype = T;
+
+    static constexpr int Pack_M = 1;
+
+    static constexpr Pack  kPack  = HMMA_884 | OPERAND_V | Pack_M;
+    static constexpr Order kOrder = kColMajor;
+
+    using SmemCopyAtom = SmemCopyAtom_Pack_v3<T, SmemCopy_MMA_884_V<T, 8>, kColMajor, Pack_M>;
+
+    struct GetSmemLayout {  // m-major
+        template<int M, int K>
+        static constexpr auto apply(pair<M, K>)
+        {
+            return SmemLayoutV2<K, M>{};
+        }
+    };
+
+    using GetGmemIter = GetGmemIter;
+};
+
+}  // namespace sm70_s884
+
+template<class T>
+struct GetOperand<HMMA_884, OPERAND_A, T, kRowMajor, false>: std::true_type {
+    using Operand = sm70_s884::Operand_A<T>;
+};
+
+template<class T>
+struct GetOperand<HMMA_884, OPERAND_B, T, kRowMajor, false>: std::true_type {
+    using Operand = sm70_s884::Operand_B<T>;
+};
+
+template<class T>
+struct GetOperand<HMMA_884, OPERAND_V, T, kColMajor, false>: std::true_type {
+    using Operand = sm70_s884::Operand_V<T>;
+};
+
+template<class T>
+struct GetOperand<HMMA_884, OPERAND_B, T, kRowMajor, true>: std::true_type {
+    using Operand = sm70_s884::Operand_B_Pack<T>;
+};
+
+template<class T>
+struct GetOperand<HMMA_884, OPERAND_V, T, kColMajor, true>: std::true_type {
+    using Operand = sm70_s884::Operand_V_Pack<T>;
+};
+
+}  // namespace turbomind::gemm

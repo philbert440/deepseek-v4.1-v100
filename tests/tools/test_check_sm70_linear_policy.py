@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from tools.pre_commit.check_sm70_linear_policy import violations
+
+
+def test_reject_registered_variable_outside_compatibility_adapter(tmp_path):
+    path = tmp_path / "vllm" / "new_kernel.py"
+    path.parent.mkdir()
+    path.write_text("import vllm.envs as envs\nx = envs.VLLM_SM70_NVFP4_QPN2\n")
+    assert len(violations(path)) == 1
+    path.write_text('import os\nx = os.getenv("VLLM_SM70_NVFP4_QPN2", "0")\n')
+    assert len(violations(path)) == 1
+    path.write_text("x = config.kernel_config.sm70_nvfp4.qpn2\n")
+    assert not violations(path)
+
+
+def test_awq_runtime_alias_read_is_rejected(tmp_path):
+    path = tmp_path / "vllm" / "new_awq_kernel.py"
+    path.parent.mkdir()
+    path.write_text("x = envs.VLLM_SM70_AWQ_MLP_ENGINE\n")
+    assert len(violations(path)) == 1
+
+
+def test_fp8_serialized_loader_and_kernel_cannot_reparse_aliases(tmp_path):
+    directory = tmp_path / "vllm"
+    directory.mkdir()
+    path = directory / "fp8.py"
+    path.write_text("class Fp8LinearMethod:\n    policy = envs.VLLM_SM70_FP8_QPN8\n")
+    assert len(violations(path)) == 1
+    path.write_text("class Fp8Config:\n    admission = envs.VLLM_SM70_FP8_TURBOMIND\n")
+    assert not violations(path)
+    path = directory / "sm70_fp8.py"
+    path.write_text('import os\nx = os.getenv("VLLM_SM70_FP8_QPN8")\n')
+    assert len(violations(path)) == 1
+
+
+def test_dflash_verifier_cannot_bypass_its_engine_policy(tmp_path):
+    path = tmp_path / "vllm" / "new_verifier.py"
+    path.parent.mkdir()
+    path.write_text("enabled = envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE\n")
+    assert len(violations(path)) == 1
+    path.write_text('enabled = os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0")\n')
+    assert len(violations(path)) == 1
+    path.write_text('enabled = sm70_dflash2_enabled("context_pipeline", policy)\n')
+    assert not violations(path)

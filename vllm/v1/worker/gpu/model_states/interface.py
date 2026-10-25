@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from abc import ABC, abstractmethod
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.tasks import GenerationTask
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.utils import AttentionGroup
+
+
+class ModelSpecificAttnMetadata:
+    """Base class for model-specific attention metadata."""
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        return {}
+
+    def get_extra_attn_kwargs(
+        self,
+        attn_metadata_builder: Any,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        return {}
+
+
+class ModelState(ABC):
+    supports_early_input_preparation: bool = False
+    """Inputs can be prepared from request/token buffers before attention metadata.
+
+    Opt in only when prepare_inputs does not consume attention metadata or
+    recurrent-state migration results. Operations stay on the current stream.
+    """
+
+    @abstractmethod
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
+        raise NotImplementedError
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        return None
+
+    def apply_staged_writes(self) -> None:
+        return None
+
+    def preprocess_state(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        """Hook for model-specific state movement before a real forward."""
+        return None
+
+    def postprocess_state(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
+        num_computed_tokens: torch.Tensor | None = None,
+    ) -> None:
+        return None
+
+    @abstractmethod
+    def get_mm_embeddings(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> torch.Tensor | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_attn(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        raise NotImplementedError

@@ -1,0 +1,577 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Strictly gated compact target rejection for DFlash2 on SM70."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
+
+import vllm.envs as envs
+from vllm.config.sm70_dflash2 import (
+    sm70_dflash2_enabled,
+)
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    dflash2_sparse_topk_rejection_sample,
+    rejection_sample,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import GrammarOutput
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+logger = init_logger(__name__)
+
+_TARGET_TOP_K = 20
+_TARGET_PROBE_K = 64
+_SELECTOR_ALIGNMENT_DUMP_COUNT = 0
+_SELECTOR_ALIGNMENT_STEP = 0
+
+
+@dataclass(frozen=True)
+class DFlash2LogitsFallback:
+    """A completed dense projection; non-gather ranks may have no logits."""
+
+    logits: torch.Tensor | None
+
+
+@triton.jit
+def _compact_target_reference_rows_kernel(
+    probe,
+    temperatures,
+    top_ps,
+    row_to_request,
+    reference_rows,
+    row_stride: tl.constexpr,
+    width: tl.constexpr,
+    top_k: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    request = tl.load(row_to_request + row)
+    temperature = tl.load(temperatures + request)
+    top_p = tl.load(top_ps + request)
+    values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
+    first = tl.load(probe + row * row_stride) / temperature
+    cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
+    last = tl.load(probe + row * row_stride + width - 1) / temperature
+    logits = values / temperature
+    keep = (col < width) & (logits >= cutoff)
+    logits = tl.where(keep, logits, -float("inf"))
+    probabilities = tl.exp(logits - tl.max(logits, 0))
+    probabilities /= tl.sum(probabilities, 0)
+    before = tl.cumsum(probabilities, 0) - probabilities
+    # Double the CPU reference guard's margin: different FP32 reductions
+    # can add a conservative fallback near the guard, never justify relaxing it.
+    margin: tl.constexpr = 16 * width * 1.1920928955078125e-7
+    near_cutoff = (
+        tl.sum(((tl.abs(before - top_p) <= margin) & (col < width)).to(tl.int32), 0) > 0
+    )
+    underflow = tl.sum(((probabilities == 0) & keep).to(tl.int32), 0) > 0
+    has_nan = tl.sum(((values != values) & (col < width)).to(tl.int32), 0) > 0
+    bad_first = (first != first) | (tl.abs(first) == float("inf"))
+    reference = (
+        (last >= cutoff)
+        | bad_first
+        | has_nan
+        | underflow
+        | (near_cutoff & (top_p < 1.0))
+    )
+    tl.store(reference_rows + row, reference)
+
+
+def _compact_target_reference_flags(
+    probe: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+) -> torch.Tensor:
+    """Compute graph-capturable fallback flags with the request-slot map."""
+    rows, width = probe.shape
+    result = torch.empty(rows, device=probe.device, dtype=torch.bool)
+    _compact_target_reference_rows_kernel[(rows,)](
+        probe,
+        temperatures,
+        top_ps,
+        row_to_request,
+        result,
+        probe.stride(0),
+        width,
+        _TARGET_TOP_K,
+        triton.next_power_of_2(width),
+        num_warps=1,
+    )
+    return result
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+) -> np.ndarray:
+    """Copy only fallback decisions, preserving the request-slot parameter map."""
+    return (
+        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
+        .cpu()
+        .numpy()
+    )
+
+
+def _compact_target_reference_rows(
+    probe_logits: torch.Tensor,
+    temperature: float | np.ndarray,
+    top_p: float | np.ndarray,
+    *,
+    vocab_ordered: bool = False,
+) -> np.ndarray:
+    """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
+
+    The 21st candidate detects a tie crossing top-20. Ties wholly inside the
+    retained nucleus are harmless; ties split by top-p need the reference's
+    vocabulary tie order. The small CDF guard also covers FP32 scan rounding.
+    Sampling parameters are scalar or per-logit-row arrays. This is called
+    outside the model CUDA graphs, once per verification batch.
+    """
+    # The branch needs one host decision anyway. Copy the compact probe once
+    # instead of launching a chain of GPU reductions followed by the same fence.
+    probe = probe_logits.detach().cpu().float().numpy()
+    temperature = np.asarray(temperature, dtype=np.float32).reshape(-1, 1)
+    top_p = np.asarray(top_p, dtype=np.float32).reshape(-1, 1)
+    if vocab_ordered:
+        # The wider probe contains all cutoff ties unless its last value
+        # reaches the top-k boundary. Descending vocabulary order also
+        # reproduces a split top-p tie in the reference's retained suffix.
+        logits = probe / temperature
+        truncated = probe[:, -1] >= probe[:, _TARGET_TOP_K - 1]
+        keep_k = logits >= logits[:, _TARGET_TOP_K - 1 : _TARGET_TOP_K]
+        logits = np.where(keep_k, logits, -np.inf)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs /= probs.sum(axis=-1, keepdims=True)
+        before = probs.cumsum(axis=-1) - probs
+        margin = 8 * probe.shape[1] * np.finfo(np.float32).eps
+        near_cutoff = (np.abs(before - top_p) <= margin).any(axis=-1)
+        underflow = ((probs == 0) & keep_k).any(axis=-1)
+        return (
+            truncated
+            | ~np.isfinite(logits[:, 0])
+            | np.isnan(probe).any(axis=-1)
+            | underflow
+            | (near_cutoff & (top_p[:, 0] < 1.0))
+        )
+    logits = probe[:, :_TARGET_TOP_K] / temperature
+    exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
+    before = probs.cumsum(axis=-1) - probs
+    keep = before < top_p
+    cutoff_tie = probe[:, -2] == probe[:, -1]
+    nucleus_tie = (
+        (logits[:, :-1] == logits[:, 1:]) & (keep[:, :-1] != keep[:, 1:])
+    ).any(axis=-1)
+    near_cutoff = np.abs(before - top_p).min(axis=-1) <= (16 * np.finfo(np.float32).eps)
+    ambiguous = cutoff_tie | ((nucleus_tie | near_cutoff) & (top_p[:, 0] < 1.0))
+    return ambiguous
+
+
+def _compact_target_requires_reference(
+    probe_logits: torch.Tensor,
+    temperature: float | np.ndarray,
+    top_p: float | np.ndarray,
+) -> bool:
+    return bool(_compact_target_reference_rows(probe_logits, temperature, top_p).any())
+
+
+def _sample_reference_requests(
+    logits: torch.Tensor,
+    reference_reqs: np.ndarray,
+    input_batch: InputBatch,
+    rejection_sampler: RejectionSampler,
+    draft_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the unchanged dense contract for whole ambiguous requests.
+
+    Compact sampling admits no penalties, logprobs, grammar or synthetic
+    rejection. Keep original request-slot IDs, positions and local draft-step
+    indices here: packing a subset must never renumber its random streams.
+    """
+    cu = input_batch.cu_num_logits_np
+    row_indices = np.concatenate([np.arange(cu[i], cu[i + 1]) for i in reference_reqs])
+    sub_cu = np.zeros(len(reference_reqs) + 1, dtype=np.int32)
+    np.cumsum(np.diff(cu)[reference_reqs], out=sub_cu[1:])
+    # Pack metadata into a single CPU-to-GPU transfer.
+    # The rejection kernels accept either int32 or int64 cumulative offsets.
+    packed = np.concatenate((row_indices, reference_reqs, sub_cu)).astype(np.int64)
+    metadata = torch.from_numpy(packed).to(device=logits.device, non_blocking=True)
+    rows, reqs, cu_num_logits = metadata.split(
+        [row_indices.size, reference_reqs.size, sub_cu.size]
+    )
+    indices = input_batch.logits_indices[rows]
+    draft_sampled = input_batch.input_ids[indices]
+    pos = input_batch.positions[indices]
+    expanded_idx_mapping = input_batch.expanded_idx_mapping[rows]
+    expanded_local_pos = input_batch.expanded_local_pos[rows]
+    sampler = rejection_sampler.sampler
+    processed = sampler.apply_sampling_params(
+        logits[rows],
+        expanded_idx_mapping,
+        input_batch.idx_mapping_np[reference_reqs],
+        pos,
+        draft_sampled,
+        expanded_local_pos,
+    )
+    sampled, num_sampled = rejection_sample(
+        processed,
+        draft_logits,
+        draft_sampled,
+        cu_num_logits,
+        pos,
+        input_batch.idx_mapping[reqs],
+        expanded_idx_mapping,
+        expanded_local_pos,
+        sampler.sampling_states.temperature.gpu,
+        sampler.sampling_states.seeds.gpu,
+        rejection_sampler.num_speculative_steps,
+        use_fp64=sampler.use_fp64_gumbel,
+    )
+    return reqs, sampled, num_sampled
+
+
+def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
+    if not raw_steps:
+        return None
+    steps: set[int] = set()
+    try:
+        for item in raw_steps.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                if start < 0 or end < start:
+                    return set()
+                steps.update(range(start, end + 1))
+            else:
+                step = int(item)
+                if step < 0:
+                    return set()
+                steps.add(step)
+    except ValueError:
+        return set()
+    return steps
+
+
+def _safe_dump_tag(raw_tag: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw_tag)
+
+
+def _diagnostic_rank() -> int:
+    # Multiprocess workers need not export RANK/LOCAL_RANK. Falling back to
+    # zero there dumps every TP replica and overcounts independent samples.
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+
+
+def _maybe_dump_selector_alignment(
+    *,
+    speculator: DFlash2Speculator,
+    rejection_sampler: RejectionSampler,
+    input_batch: InputBatch,
+    target_topk_ids: torch.Tensor,
+    target_topk_logits: torch.Tensor,
+    draft_topk_ids: torch.Tensor,
+    draft_topk_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    pos: torch.Tensor,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+) -> None:
+    """Dump one exact B1 selector/target alignment record when requested."""
+    if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        return
+    if _diagnostic_rank() != 0:
+        return
+
+    global _SELECTOR_ALIGNMENT_DUMP_COUNT, _SELECTOR_ALIGNMENT_STEP
+    _SELECTOR_ALIGNMENT_STEP += 1
+    if _SELECTOR_ALIGNMENT_DUMP_COUNT >= envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT:
+        return
+    selected_steps = _parse_alignment_steps(envs.VLLM_SPEC_DUMP_ALIGNMENT_STEPS)
+    if selected_steps is not None and _SELECTOR_ALIGNMENT_STEP not in selected_steps:
+        return
+
+    shadow = speculator.get_selector_alignment_shadow()
+    if shadow is None:
+        return
+    shadow_ids, unary_logits, lattice_scores = shadow
+    req_state = int(input_batch.idx_mapping_np[0])
+    packed_row = 0
+    sampling_states = rejection_sampler.sampler.sampling_states
+
+    with torch.no_grad():
+        draft_sampled_cpu = draft_sampled.detach().cpu()
+        if bool(torch.all(draft_sampled_cpu == 0).item()):
+            return
+        payload = {
+            "format": "dflash2_selector_alignment_v1",
+            "rank": _diagnostic_rank(),
+            "step": _SELECTOR_ALIGNMENT_STEP,
+            "request_state": req_state,
+            "selector_top_k": speculator.selector_top_k,
+            "num_speculative_steps": speculator.num_speculative_steps,
+            "target_topk_ids": target_topk_ids.detach().cpu(),
+            "target_topk_logits": target_topk_logits.detach().float().cpu(),
+            "draft_candidate_ids": draft_topk_ids[req_state].detach().cpu(),
+            "draft_realized_logits": (
+                draft_topk_logits[req_state].detach().float().cpu()
+            ),
+            "selector_candidate_ids": shadow_ids[packed_row].detach().cpu(),
+            "selector_unary_logits": (unary_logits[packed_row].detach().float().cpu()),
+            "selector_lattice_scores": (
+                lattice_scores[packed_row].detach().float().cpu()
+            ),
+            "draft_sampled": draft_sampled_cpu,
+            "positions": pos.detach().cpu(),
+            "cu_num_logits": input_batch.cu_num_logits.detach().cpu(),
+            "idx_mapping": input_batch.idx_mapping.detach().cpu(),
+            "temperature": float(sampling_states.temperature.np[req_state]),
+            "top_p": float(sampling_states.top_p.np[req_state]),
+            "top_k": int(sampling_states.top_k.np[req_state]),
+            "sampled_token_ids": sampled.detach().cpu(),
+            "num_sampled": num_sampled.detach().cpu(),
+        }
+        _SELECTOR_ALIGNMENT_DUMP_COUNT += 1
+        dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
+        os.makedirs(dump_dir, exist_ok=True)
+        tag = _safe_dump_tag(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", ""))
+        tag_part = f"{tag}_" if tag else ""
+        dump_path = os.path.join(
+            dump_dir,
+            f"spec_alignment_dflash2_selector_{tag_part}pid{os.getpid()}_"
+            f"step{_SELECTOR_ALIGNMENT_STEP:06d}_"
+            f"{_SELECTOR_ALIGNMENT_DUMP_COUNT}.pt",
+        )
+        torch.save(payload, dump_path)
+        logger.warning("Dumped DFlash2 selector alignment diagnostics to %s", dump_path)
+
+
+def _supports_sparse_sampling_contract(
+    rejection_sampler: RejectionSampler,
+    input_batch: InputBatch,
+) -> bool:
+    """Whether compact logits preserve every requested sampling transform."""
+    if rejection_sampler.rejection_sample_method != "standard":
+        return False
+    # Every request must be in the uniform decode verifier phase. The compact
+    # kernel is request-indexed and preserves each request's sampling state.
+    if input_batch.num_reqs < 1 or np.any(input_batch.is_prefilling_np):
+        return False
+
+    sampler = rejection_sampler.sampler
+    idx = input_batch.idx_mapping_np
+    states = sampler.sampling_states
+    temperatures = states.temperature.np[idx]
+    top_k = states.top_k.np[idx]
+    top_p = states.top_p.np[idx]
+    if np.any(temperatures <= 0.0):
+        return False
+    if np.any(top_k != _TARGET_TOP_K):
+        return False
+    if np.any((top_p <= 0.0) | (top_p > 1.0)):
+        return False
+    if np.any(states.min_p.np[idx] != 0.0):
+        return False
+
+    if np.any(sampler.penalties_state.use_penalty[idx]):
+        return False
+    if np.any(sampler.logit_bias_state.use_logit_bias[idx]):
+        return False
+    if np.any(sampler.bad_words_state.num_bad_words.np[idx] != 0):
+        return False
+    if states.max_num_logprobs(idx) != NO_LOGPROBS:
+        return False
+    if sampler.logprob_token_ids_state.max_num_token_ids(idx) != 0:
+        return False
+    return not sampler.compute_nans
+
+
+def try_dflash2_sparse_target_rejection(
+    model: Any,
+    speculator: Any,
+    rejection_sampler: RejectionSampler,
+    sample_hidden_states: torch.Tensor,
+    input_batch: InputBatch,
+    grammar_output: GrammarOutput | None,
+    *,
+    allow_graph: bool = True,
+) -> SamplerOutput | DFlash2LogitsFallback | None:
+    """Sample compact supports or retain computed logits for exact fallback."""
+    if not sm70_dflash2_enabled(
+        "sparse_target_rejection", getattr(speculator, "_sm70_dflash2_policy", None)
+    ):
+        return None
+    if not isinstance(speculator, DFlash2Speculator):
+        return None
+    if grammar_output is not None or input_batch.has_structured_output_reqs:
+        return None
+    if sample_hidden_states.device.type != "cuda":
+        return None
+    if torch.cuda.get_device_capability(sample_hidden_states.device) != (7, 0):
+        return None
+    if not hasattr(model, "get_topk_tokens_and_logits"):
+        return None
+    if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
+        return None
+
+    sparse_draft_logits = speculator.get_sparse_draft_logits()
+    if sparse_draft_logits is None:
+        return None
+    if allow_graph and not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        from .sampler_graph import try_graph_rejection
+
+        result = try_graph_rejection(
+            model,
+            speculator,
+            rejection_sampler,
+            sample_hidden_states,
+            input_batch,
+            sparse_draft_logits,
+        )
+        if result is not None:
+            return result
+    draft_topk_ids, draft_topk_logits = sparse_draft_logits
+    idx = input_batch.idx_mapping_np
+    states = rejection_sampler.sampler.sampling_states
+    # The reference sampler dispatches on logit rows, not request count.
+    # A single q8 verifier has eight rows and uses the same large-vocabulary
+    # radix tie order as a batch. Retain every cutoff tie in that case too.
+    retain_ties = (
+        int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+    )
+    probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
+    fallback = None
+    if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
+        target_topk_ids, target_topk_logits, fallback = (
+            model.get_compact_target_probe_with_fallback(sample_hidden_states, probe_k)
+        )
+    elif hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
+        target_topk_ids, target_topk_logits, fallback = (
+            model.get_topk_tokens_and_logits_with_fallback(
+                sample_hidden_states, probe_k
+            )
+        )
+    else:
+        target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
+            sample_hidden_states, probe_k
+        )
+    if retain_ties:
+        target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
+            target_topk_logits,
+            target_topk_ids,
+            vocab_size=states.vocab_size,
+            descending=True,
+        )
+    # Packed verifier rows need their own request's sampling parameters.
+    # Reusing the first request misses ambiguous nuclei in heterogeneous batches.
+    if retain_ties:
+        reference_rows = _compact_target_reference_rows_gpu(
+            target_topk_logits,
+            states.temperature.gpu,
+            states.top_p.gpu,
+            input_batch.expanded_idx_mapping,
+        )
+    else:
+        num_logits = np.diff(input_batch.cu_num_logits_np)
+        reference_rows = _compact_target_reference_rows(
+            target_topk_logits,
+            np.repeat(states.temperature.np[idx], num_logits),
+            np.repeat(states.top_p.np[idx], num_logits),
+        )
+    reference_reqs = np.flatnonzero(
+        np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
+    )
+    reference_logits = None
+    if reference_reqs.size:
+        logger.info_once(
+            "DFlash2 target cutoff requires full-vocabulary reference sampling."
+        )
+        if fallback is None:
+            return None
+        reference_logits = fallback()
+        if reference_reqs.size == idx.size or reference_logits is None:
+            return DFlash2LogitsFallback(reference_logits)
+    if not retain_ties:
+        target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
+        target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
+    num_rows = target_topk_ids.shape[0]
+    if input_batch.num_tokens == num_rows:
+        # Uniform decode logits_indices spans the entire real query.
+        # Keep views instead of launching two identity gather kernels.
+        draft_sampled = input_batch.input_ids[:num_rows]
+        pos = input_batch.positions[:num_rows]
+    else:
+        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        pos = input_batch.positions[input_batch.logits_indices]
+    sampled, num_sampled = dflash2_sparse_topk_rejection_sample(
+        target_topk_ids,
+        target_topk_logits,
+        draft_topk_ids,
+        draft_topk_logits,
+        draft_sampled,
+        input_batch.cu_num_logits,
+        pos,
+        input_batch.idx_mapping,
+        rejection_sampler.sampler.sampling_states.temperature.gpu,
+        rejection_sampler.sampler.sampling_states.top_p.gpu,
+        rejection_sampler.sampler.sampling_states.seeds.gpu,
+        rejection_sampler.num_speculative_steps,
+        use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
+        target_top_k=_TARGET_TOP_K,
+    )
+    if reference_logits is not None:
+        reqs, dense_sampled, dense_num_sampled = _sample_reference_requests(
+            reference_logits,
+            reference_reqs,
+            input_batch,
+            rejection_sampler,
+            speculator.draft_logits,
+        )
+        sampled.index_copy_(0, reqs, dense_sampled)
+        num_sampled.index_copy_(0, reqs, dense_num_sampled)
+    if envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        _maybe_dump_selector_alignment(
+            speculator=speculator,
+            rejection_sampler=rejection_sampler,
+            input_batch=input_batch,
+            target_topk_ids=target_topk_ids,
+            target_topk_logits=target_topk_logits,
+            draft_topk_ids=draft_topk_ids,
+            draft_topk_logits=draft_topk_logits,
+            draft_sampled=draft_sampled,
+            pos=pos,
+            sampled=sampled,
+            num_sampled=num_sampled,
+        )
+    logger.info_once("Using SM70 DFlash2 compact target top-k rejection sampling.")
+    return SamplerOutput(
+        sampled_token_ids=sampled,
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=num_sampled,
+    )

@@ -1,0 +1,11 @@
+include LICENSE
+include requirements/common.txt
+include requirements/cuda.txt
+include requirements/rocm.txt
+include requirements/cpu.txt
+include CMakeLists.txt
+
+recursive-include cmake *
+recursive-include csrc *
+recursive-include flash_qla *.py *.cu LICENSE
+recursive-include flash-attention-v100/kernel/h3 *.cu *.h *.md

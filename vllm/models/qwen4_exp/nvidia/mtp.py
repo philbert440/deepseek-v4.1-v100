@@ -1,0 +1,725 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Inference-only Qwen4Exp MTP (Multi-Token Predictor) model.
+
+The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
+  - drops all multi-modal handling (text-only),
+  - forces PLE off while keeping the main model's HC stream count,
+  - fuses the backbone hidden and the new-token embedding via
+    ``residual_linear_shared`` (fc_embedding + shared fc_hidden) instead of
+    the ``Linear(2H, H)`` + repeat used by other MTP variants,
+  - emits TWO hidden streams per step (scheme A): a single stream [T, H]
+    (final-mixer collapsed, fed to the LM head) and a pre-final-mixer
+    multi stream [T, hc_count*H] (fed to the next draft step).
+"""
+
+from collections.abc import Iterable
+
+import regex as re
+import torch
+from torch import nn
+
+import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
+from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.utils import configure_quant_config
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    get_draft_quant_config,
+    make_empty_intermediate_tensors_factory,
+    maybe_fuse_shared_experts,
+    maybe_prefix,
+)
+from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.qwen4_exp import (
+    Qwen4ExpTextConfig,
+)
+
+from .hyperconnection import GatedResidual, HyperConnectionConfig
+
+try:
+    from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+except ModuleNotFoundError as exc:
+    # The Blackwell-only CuTe DSL helper is absent from the 1Cat SM70 tree.
+    if exc.name != "vllm.model_executor.kernels.linear.cute_dsl":
+        raise
+
+    def enable_qwen4_exp_low_latency_gemm(
+        module: nn.Module, dtype: torch.dtype
+    ) -> None:
+        del module, dtype
+
+
+from .model import (
+    _HC_WEIGHTS_MAPPER,
+    _QWEN3_5_WEIGHTS_MAPPER,
+    _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
+    Qwen4ExpDecoderLayer,
+    Qwen4ExpMixtureOfExperts,
+    _make_qwen38_decode_compile_config,
+)
+from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
+from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+
+logger = init_logger(__name__)
+
+
+def _remap_ignored_layers(
+    ignored_layers: list[str],
+    mtp_start_layer_idx: int,
+) -> list[str]:
+    remapped: list[str] = []
+    for name in ignored_layers:
+        if name.startswith("mtp."):
+            new_name = re.sub(
+                r"(?<=\.layers\.)\d+",
+                lambda m: str(mtp_start_layer_idx + int(m.group(0))),
+                name,
+            )
+            remapped.append(new_name)
+        else:
+            remapped.append(name)
+    return remapped
+
+
+def _remap_quantized_layers(
+    quantized_layers: dict[str, dict],
+    mtp_start_layer_idx: int,
+) -> dict[str, dict]:
+    """Map checkpoint MTP layer indices to standalone draft indices."""
+    return {
+        _remap_ignored_layers([name], mtp_start_layer_idx)[0]: layer_info
+        for name, layer_info in quantized_layers.items()
+    }
+
+
+def _remap_mtp_weight_name(name: str) -> str | None:
+    """Map Qwen4Exp checkpoint paths into the standalone draft model."""
+
+    for checkpoint_prefix in (
+        "model.language_model.",
+        "language_model.",
+    ):
+        if name.startswith(checkpoint_prefix):
+            name = name.removeprefix(checkpoint_prefix)
+            break
+
+    if name.startswith("embed_tokens."):
+        name = f"model.{name}"
+    if name.startswith("model.mtp."):
+        name = name.removeprefix("model.")
+    if name.startswith("mtp.shared_head.head."):
+        return name.replace("mtp.shared_head.head.", "lm_head.", 1)
+    if name.startswith("model.shared_head.head."):
+        return name.replace("model.shared_head.head.", "lm_head.", 1)
+    if name.startswith("shared_head.head."):
+        return name.replace("shared_head.head.", "lm_head.", 1)
+    if name.startswith("model.lm_head."):
+        return name.removeprefix("model.")
+    if name.startswith("mtp."):
+        return name.replace("mtp.", "model.", 1)
+    if name.startswith("model.embed_tokens.") or name.startswith("lm_head."):
+        return name
+    return None
+
+
+def _validate_mtp_expert_weights_loaded(
+    model: nn.Module,
+    loaded_weights: set[str],
+) -> None:
+    """Reject a silently incomplete Qwen4Exp MTP routed-expert load."""
+
+    required_suffixes = (
+        ".mlp.experts.w13_weight",
+        ".mlp.experts.w2_weight",
+    )
+    required = {
+        name for name, _ in model.named_parameters() if name.endswith(required_suffixes)
+    }
+    missing = required - loaded_weights
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        raise ValueError(
+            "Qwen4Exp MTP routed-expert checkpoint weights were not loaded: "
+            f"{missing_names}. Check fused/per-expert checkpoint mappings."
+        )
+
+
+def _mtp_fp8_experts_supported(
+    draft_vllm_config: VllmConfig,
+    draft_quant_config: QuantizationConfig,
+    speculative_config: SpeculativeConfig,
+    exact_sm70: bool,
+    online_fp8: bool,
+) -> bool:
+    """Whether the SM70 FP8 MTP expert method can serve this draft.
+
+    Checkpoint FP8 experts are allowed under pipeline parallelism: the V2
+    runner builds the speculator only on the last pipeline rank, so the
+    drafter is stage-local and the FP8 expert padding follows that stage's
+    tensor-parallel size. Online conversion keeps the single-stage limit
+    until it is validated under pipeline parallelism as well.
+    """
+    return (
+        exact_sm70
+        and (
+            not online_fp8
+            or draft_vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
+        and draft_vllm_config.model_config.dtype == torch.float16
+        and draft_quant_config.get_name()
+        in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
+        and not draft_vllm_config.parallel_config.enable_expert_parallel
+        and speculative_config.rejection_sample_method == "standard"
+    )
+
+
+def _make_draft_vllm_config(
+    vllm_config: VllmConfig,
+    mtp_start_layer_idx: int,
+) -> VllmConfig:
+    """Ensure that the draft model config is set in the vLLM config."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.draft_model_config is None:
+        raise ValueError("speculative_config.draft_model_config must be set")
+
+    draft_quant_config = get_draft_quant_config(vllm_config)
+
+    # inject packed and ignored modules to the quantization config of draft model
+    if draft_quant_config is not None:
+        configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
+        if ignored_layers:
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "ignored_layers",
+                _remap_ignored_layers(ignored_layers, mtp_start_layer_idx),
+            )
+        exclude_modules = getattr(draft_quant_config, "exclude_modules", None)
+        if exclude_modules:
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "exclude_modules",
+                _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
+            )
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if quantized_layers:
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "quantized_layers",
+                _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
+            )
+
+    draft_vllm_config = replace(
+        vllm_config,
+        model_config=speculative_config.draft_model_config,
+        is_speculative_draft=True,
+    )
+    # VllmConfig post-init derives the target quant config, so restore the
+    # independently resolved draft quant config after replacement.
+    from vllm.model_executor.layers.quantization.sm70_turbomind import (
+        is_exact_sm70_cuda_platform,
+    )
+
+    from .mtp_fp8_experts import MTPExpertFp8Config, checkpoint_fp8_prefixes
+
+    online_fp8 = getattr(speculative_config, "mtp_expert_quantization", None) == "fp8"
+    checkpoint_prefixes = set()
+    if draft_quant_config is not None and is_exact_sm70_cuda_platform():
+        config = draft_vllm_config.model_config.hf_text_config
+        prefixes = {
+            f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
+            for index in range(getattr(config, "mtp_num_hidden_layers", 1))
+        }
+        checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
+    if online_fp8 or checkpoint_prefixes:
+        if draft_quant_config is None or not _mtp_fp8_experts_supported(
+            draft_vllm_config,
+            draft_quant_config,
+            speculative_config,
+            is_exact_sm70_cuda_platform(),
+            online_fp8,
+        ):
+            raise ValueError(
+                "MTP FP8 experts require SM70, FP16, an AWQ/ModelOpt/FP8 draft "
+                "checkpoint, no expert parallelism, standard rejection sampling, "
+                "and pipeline-parallel size 1 for online conversion"
+            )
+        draft_quant_config = MTPExpertFp8Config(
+            draft_quant_config,
+            checkpoint_prefixes,
+            quantize_unquantized=online_fp8,
+        )
+    draft_vllm_config.quant_config = draft_quant_config
+    return draft_vllm_config
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    }
+)
+class Qwen4ExpMultiTokenPredictor(nn.Module):
+    hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+        model_config = vllm_config.model_config
+        config: Qwen4ExpTextConfig = model_config.hf_text_config
+
+        self.config = config
+        self.vocab_size = config.vocab_size
+
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+
+        self.hidden_size = config.hidden_size
+        self.hc_count = config.hc_count
+
+        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        draft_vllm_config = _make_draft_vllm_config(
+            vllm_config,
+            self.mtp_start_layer_idx,
+        )
+        self.fp8_mtp_checkpoint_prefixes = {
+            f"model.layers.{int(name.split('.')[2]) - self.mtp_start_layer_idx}"
+            ".mlp.experts"
+            for name in getattr(
+                draft_vllm_config.quant_config, "checkpoint_prefixes", ()
+            )
+        }
+        self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+        # Phase 2: the drafter shares the target cache_config; remember the main
+        # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
+        self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
+        with set_current_vllm_config(draft_vllm_config, prefix=prefix):
+            # residual_linear_shared fusion: fc_embedding projects the token
+            # embedding, fc_hidden (shared across HC branches) projects the
+            # backbone hidden; the embedding is added as a residual to every
+            # branch (see mtp_residual_linear_shared.md).
+            self.fc_embedding = ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
+                gather_output=True,
+                bias=False,
+                return_bias=False,
+                quant_config=draft_vllm_config.quant_config,
+                prefix=f"{prefix}.fc_embedding",
+            )
+            self.fc_hidden = ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
+                gather_output=True,
+                bias=False,
+                return_bias=False,
+                quant_config=draft_vllm_config.quant_config,
+                prefix=f"{prefix}.fc_hidden",
+            )
+            self.layers = nn.ModuleList(
+                Qwen4ExpDecoderLayer(
+                    draft_vllm_config,
+                    layer_type="full_attention",
+                    prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
+                )
+                for idx in range(self.num_mtp_layers)
+            )
+
+        self.pre_fc_norm_embedding = GemmaRMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
+            self.hidden_size * self.hc_count, eps=config.rms_norm_eps
+        )
+        # HC final mixer collapses the multi stream into [T, H] for the LM head.
+        hc_config = HyperConnectionConfig(
+            hc_count=config.hc_count,
+            hidden_size=config.hidden_size,
+            params_dtype=model_config.dtype,
+            hc_lowrank=config.hc_lowrank,
+            rms_norm_eps=config.rms_norm_eps,
+            hc_per_branch_norm=True,
+        )
+        self.hyper_connection_mixer = GatedResidual(
+            hc_config,
+            use_combine=False,
+            prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], self.hidden_size * self.hc_count
+        )
+
+    def _iter_qsa_attentions(self):
+        """Yield MTP attention modules that own a QSA indexer."""
+
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if (
+                attention is not None
+                and getattr(attention, "indexer", None) is not None
+            ):
+                yield attention
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Select on MTP step 0 and reuse its QSA indices on later steps."""
+
+        for attention in self._iter_qsa_attentions():
+            attention.indexer.skip_topk = skip
+
+    def compact_topk_indices(self, row_indices: torch.Tensor) -> None:
+        """Keep each request's target-aligned step-0 sparse-index row."""
+
+        num_rows = row_indices.numel()
+        for attention in self._iter_qsa_attentions():
+            buffer = attention.topk_indices_buffer
+            selected = buffer.index_select(0, row_indices)
+            buffer[:num_rows].copy_(selected)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        hc_count = self.hc_count
+        hidden_size = self.hidden_size
+
+        # The drafter is stage-local, so this module is always a complete
+        # model: gpu_model_runner returns the IntermediateTensors on every
+        # non-final pipeline rank before speculation is reached, and the
+        # weights here are replicated rather than partitioned (embed_tokens,
+        # fc_embedding, fc_hidden and every MTP layer are built on all ranks).
+        # Branching on the TARGET model's pipeline position sent the final
+        # rank into the "receive from the previous stage" path and asserted on
+        # intermediate tensors that nobody sends -- with the fullgraph AOT
+        # compile of 1.5.0 that is a hard compile error, so no k > 0 boots at
+        # all under pipeline parallelism.
+        assert hidden_states is not None
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embed_input_ids(input_ids)
+        from .sm70_mtp_fc import maybe_combine_fc
+
+        combined = maybe_combine_fc(self, inputs_embeds, hidden_states)
+        if combined is not None:
+            hidden_states = combined
+        else:
+            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            inputs_embeds = self.fc_embedding(inputs_embeds)
+
+            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+            # the main model truly emits the pre-final-mixer multi stream
+            # on the first step; subsequent steps reuse the prior draft
+            # step's multi stream).
+            num_tokens = hidden_states.shape[0]
+            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                num_tokens, hc_count, hidden_size
+            )
+            hidden_states = self.fc_hidden(hidden_states)
+            # Add the embedding residual to every branch, then fold back
+            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            hidden_states = hidden_states.flatten(-2)
+
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        layer = self.layers[current_step_idx]
+        hidden_states, block_output, injection = layer(
+            hidden_states=hidden_states,
+            prev_block_output=None,
+            prev_injection=None,
+            positions=positions,
+            input_ids=None,
+            query_start_loc=None,
+            ngram_context=None,
+        )
+        # Last PP rank finalize. Keep both:
+        #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
+        #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
+        #       for the next draft step (zero extra compute, just kept).
+        multi_hidden, sample_hidden_states, _ = (
+            self.hyper_connection_mixer.combine_and_mix(
+                hidden_states, block_output, injection
+            )
+        )
+        return sample_hidden_states, multi_hidden
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = maybe_fuse_shared_experts(
+            weights,
+            n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
+            n_shared_experts=1,
+            ckpt_prefix="mlp.shared_expert",
+        )
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    }
+)
+class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
+    """Small-shape compiled view sharing all drafter parameters and state."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpMultiTokenPredictor,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+        )
+
+
+@support_torch_compile(
+    # As on the target, selection between the two compiled backbones must
+    # remain outside the first, prefill-specialized compiled wrapper.
+    enable_if=lambda cfg: not envs.VLLM_SM70_QWEN38_DUAL_COMPILE,
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    },
+)
+class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
+    # target experts and PLE tables. Loading the standalone drafter from that
+    # compact shard set avoids scanning the full target checkpoint a second
+    # time. The remaining patterns preserve compatibility with conventional
+    # Hugging Face checkpoint layouts.
+    allow_patterns_overrides = [
+        "model-bf16-*.safetensors",
+        "*.safetensors",
+        "*.bin",
+        "*.pt",
+    ]
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+            "_input_mix_padding",
+        ],
+    }
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        self.vllm_config = vllm_config
+        cache_config = vllm_config.cache_config
+        if cache_config.mamba_cache_mode == "all":
+            raise NotImplementedError(
+                "Qwen4ExpMTP currently does not support 'all' prefix caching, "
+                "please use '--mamba-cache-mode=align' instead"
+            )
+
+        self.quant_config = vllm_config.quant_config
+
+        super().__init__()
+        self.config = config
+        self.model = Qwen4ExpMultiTokenPredictor(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "mtp"),
+        )
+
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
+        self.set_moe_parameters(self.model.layers)
+        enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        config_dtype = vllm_config.model_config.dtype
+        enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
+        enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
+        object.__setattr__(self, "_sm70_decode_graph_model", None)
+        self._sm70_draft_head = None
+
+    def prepare_sm70_draft_head(self) -> None:
+        # Called after checkpoint loading and target-head sharing, before KV
+        # allocation and warmup consume the startup quantization workspace.
+        if self._sm70_draft_head is None:
+            from .sm70_mtp_head import prepare_mtp_qpn8_head
+
+            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        # Retain the fallback for callers that do not use the Eagle loader.
+        self.prepare_sm70_draft_head()
+        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+            return False
+        if self._sm70_decode_graph_model is None:
+            decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpMTPDecodeGraphModel(
+                    target_model=self.model, vllm_config=decode_config
+                )
+            object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
+            logger.info_once(
+                "Prepared shared-weight SM70 Qwen3.8 MTP decode compiler; "
+                "supported draft shapes reuse the common FP16 GEMV/HC routes."
+            )
+        return True
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        backbone = self.model
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+            backbone = self._sm70_decode_graph_model
+            if backbone is None:
+                raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")
+            if inputs_embeds is None:
+                assert input_ids is not None
+                # Keep the unchanged vocabulary lookup outside the compiled
+                # backbone. Combo-kernel benchmarking otherwise synthesizes a
+                # full 304-MiB TP vocabulary shard during graph startup. The
+                # outer CUDA graph still captures lookup and its TP reduction.
+                inputs_embeds = self.model.embed_input_ids(input_ids)
+        return backbone(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
+        )
+
+    def compute_logits(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor | None:
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor(head, hidden_states)
+
+    def get_top_tokens(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor:
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor.get_top_tokens(head, hidden_states)
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but the MTP tensors.
+        return _remap_mtp_weight_name(name) is None
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def remap_weight_names():
+            for name, weight in weights:
+                remapped_name = _remap_mtp_weight_name(name)
+                if remapped_name is not None:
+                    yield remapped_name, weight
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+        )
+        from .mtp_fp8_checkpoint import prepare_mtp_fp8_checkpoint
+
+        loaded_weights = loader.load_weights(
+            prepare_mtp_fp8_checkpoint(
+                remap_weight_names(),
+                self.model.fp8_mtp_checkpoint_prefixes,
+                tp_size=self.model.fp8_mtp_tp_size,
+                num_experts=self.model.config.num_experts,
+            )
+        )
+        _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        # Phase 2: an E4M3 main KV cache makes the drafter's QSA layer E4M3 too.
+        # Finalize its calibrated k/v scales strictly from the checkpoint (no
+        # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
+        # and on the PLE offload process (is_offload_process()).
+        from .model import _finalize_qsa_e4m3_scale_load
+
+        _finalize_qsa_e4m3_scale_load(
+            self,
+            loaded_weights,
+            self.model._kv_cache_dtype,
+            require_calibrated_speculative_draft=True,
+        )
+        return loaded_weights
+
+
+__all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

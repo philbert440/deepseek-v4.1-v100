@@ -1,0 +1,772 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import Any, NamedTuple
+
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+import vllm.envs as envs
+from vllm.compilation.counter import compilation_counter
+from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.config.speculative import (
+    get_dflash_model_draft_tokens,
+    uses_adaptive_dflash_lookup,
+)
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    graph_capture,
+    is_global_first_rank,
+)
+from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.offloader.base import get_offloader
+from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+
+def _supports_sm70_long_batch_graphs(vllm_config: VllmConfig) -> bool:
+    """Avoid extra batch captures when the attention operator would fall back."""
+    model = getattr(vllm_config, "model_config", None)
+    cache = getattr(vllm_config, "cache_config", None)
+    if (
+        model is None
+        or getattr(model, "dtype", None) != torch.float16
+        or getattr(cache, "cache_dtype", None) not in ("fp8", "fp8_e4m3")
+    ):
+        return False
+    parallel = vllm_config.parallel_config
+    return model.get_head_size() == 256 and model.get_num_attention_heads(
+        parallel
+    ) == 6 * model.get_num_kv_heads(parallel)
+
+
+def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
+    """Return an operator-provided V2 CUDA graph memory reserve in bytes."""
+    reserve_mib = envs.VLLM_V2_CUDAGRAPH_MEM_MIB
+    if reserve_mib < 0:
+        raise ValueError("VLLM_V2_CUDAGRAPH_MEM_MIB must be non-negative")
+    if reserve_mib == 0 or cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+
+    reserve_bytes = int(reserve_mib * 1024 * 1024)
+    logger.info(
+        "Reserving %.2f GiB for V2 CUDA graphs before sizing the KV cache "
+        "(VLLM_V2_CUDAGRAPH_MEM_MIB)",
+        reserve_bytes / 2**30,
+    )
+    return reserve_bytes
+
+
+def _worker_device_is_pre_ampere() -> bool:
+    """Whether this worker's own device is Volta or Turing.
+
+    The SM70 graph tunings are pre-Ampere tunings: Turing runs the same
+    kernels, the same fp16 contract and the same compile graph as Volta.
+    Asking index 0 of the visibility list would answer for a different
+    worker on a mixed rig, so ask the device this process has selected.
+    """
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability(
+        device_id=torch.accelerator.current_device_index()
+    )
+    return capability is not None and (capability.major, capability.minor) in (
+        (7, 0),
+        (7, 5),
+    )
+
+
+def get_sm70_cudagraph_memory_reserve(
+    cudagraph_mode: CUDAGraphMode, activation_peak_bytes: int
+) -> int:
+    """Budget a profiled activation peak for graph pools, unless overridden.
+
+    V2 cannot capture the real graphs before allocating KV. Reserve the measured
+    forward scratch peak instead of silently reserving zero on SM70. This is an
+    admission estimate, not a hard cap on the CUDA caching allocator.
+    """
+    if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+        return get_explicit_cudagraph_memory_reserve(cudagraph_mode)
+    if cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+    return max(0, activation_peak_bytes)
+
+
+def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return bool(
+        envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
+        and speculative_config is not None
+        and speculative_config.method == "mtp"
+        and _worker_device_is_pre_ampere()
+    )
+
+
+def _split_sm70_mtp_manager_capture_sizes(
+    vllm_config: VllmConfig,
+    decode_query_len: int,
+) -> list[int]:
+    capture_sizes = sorted(vllm_config.compilation_config.cudagraph_capture_sizes or [])
+    if decode_query_len != 1:
+        return capture_sizes
+
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    verifier_query_len = speculative_config.num_speculative_state_tokens() + 1
+    return [
+        size // verifier_query_len
+        for size in capture_sizes
+        if size % verifier_query_len == 0
+        and size // verifier_query_len <= vllm_config.scheduler_config.max_num_seqs
+    ]
+
+
+class CapturedAttentionState(NamedTuple):
+    attn_metadata: dict[str, Any] | None
+    slot_mappings: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class BatchExecutionDescriptor:
+    """Describes the shape of the batch and CG mode to run; this is used to make shape
+    matches between the capture and runtime."""
+
+    cg_mode: CUDAGraphMode
+    num_tokens: int
+    num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
+    uniform_token_count: int | None = None
+    attention_context_bucket: int | None = None
+
+
+def _is_compatible(
+    desc: BatchExecutionDescriptor,
+    num_reqs: int,
+    num_tokens: int,
+    uniform_token_count: int | None,
+) -> bool:
+    # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
+    # desc.num_reqs=None means no request padding needed (PIECEWISE)
+    return (
+        (
+            desc.uniform_token_count is None
+            or desc.uniform_token_count == uniform_token_count
+        )
+        and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
+        and desc.num_tokens >= num_tokens
+    )
+
+
+def get_uniform_token_count(
+    num_reqs: int,
+    num_tokens: int,
+    max_query_len: int,
+) -> int | None:
+    """
+    Return the uniform token count if batch is uniform, else None.
+    A batch is uniform if all requests have the same number of tokens.
+    """
+    if (max_query_len == num_tokens // num_reqs) and (
+        num_tokens == max_query_len * num_reqs
+    ):
+        return max_query_len
+    return None
+
+
+def get_uniform_decode_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+) -> int | None:
+    """Classify decode by request phase as well as shape (upstream #51865)."""
+    if has_prefill or num_reqs == 0:
+        return None
+    return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+
+class CudaGraphManager:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        cudagraph_mode: CUDAGraphMode,
+        decode_query_len: int,
+    ):
+        self.vllm_config = vllm_config
+        self.device = device
+        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.compilation_config = vllm_config.compilation_config
+        assert self.compilation_config is not None
+        self.cudagraph_mode = cudagraph_mode
+        self.decode_query_len = decode_query_len
+        self.decode_query_lens: tuple[int, ...] = (decode_query_len,)
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and uses_adaptive_dflash_lookup(
+            speculative_config
+        ):
+            model_query_len = 1 + get_dflash_model_draft_tokens(speculative_config)
+            if 1 < model_query_len < decode_query_len:
+                self.decode_query_lens = (model_query_len, decode_query_len)
+                logger.info_once(
+                    "Capturing target decode graphs for adaptive DFlash2 "
+                    "query lengths %s.",
+                    self.decode_query_lens,
+                )
+        self._sm70_dflash2_tail_graphs = bool(
+            envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            and isinstance(self, ModelCudaGraphManager)
+            and speculative_config is not None
+            and speculative_config.method == "dflash"
+            and decode_query_len == 8
+            and _worker_device_is_pre_ampere()
+            and not self.compilation_config.pass_config.enable_sp
+        )
+        if self._sm70_dflash2_tail_graphs:
+            # Target verifier tails are independent of adaptive lookup. The
+            # drafter always produces its trained block width and must not
+            # capture these target-only shapes.
+            self.decode_query_lens = tuple(
+                dict.fromkeys((*self.decode_query_lens, *range(7, 0, -1)))
+            )
+            logger.info_once(
+                "Capturing SM70 DFlash2 target tail query lengths %s.",
+                self.decode_query_lens,
+            )
+
+        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.is_first_pp_rank = get_pp_group().is_first_rank
+        self.is_last_pp_rank = get_pp_group().is_last_rank
+
+        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+
+        self._graphs_captured = False
+        self._candidates: list[list[BatchExecutionDescriptor]] = []
+        self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        if _use_split_sm70_mtp_cudagraphs(vllm_config):
+            self._capture_sizes = _split_sm70_mtp_manager_capture_sizes(
+                vllm_config,
+                decode_query_len,
+            )
+            logger.info_once(
+                "Using split SM70 MTP CUDA graph manager shapes: "
+                "decode_query_len=%d capture_sizes=%s shared_verifier_shapes=%s.",
+                decode_query_len,
+                tuple(self._capture_sizes),
+                tuple(self.compilation_config.cudagraph_capture_sizes or ()),
+            )
+        else:
+            # Legacy MRV1 behavior. The rollback path deliberately preserves
+            # the shared in-place normalization used before split managers.
+            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+                self.decode_query_len, self.tp_size
+            )
+            self._capture_sizes = list(
+                self.compilation_config.cudagraph_capture_sizes or []
+            )
+            # The sizes above are normalized around the widest target query
+            # (q16 for LABD). Preserve the checkpoint-native q8 shape so a
+            # B1 short verification can still replay a graph when
+            # max_num_seqs=1.
+            if len(self.decode_query_lens) > 1:
+                for query_len in self.decode_query_lens:
+                    if query_len not in self._capture_sizes:
+                        self._capture_sizes.append(query_len)
+                self._capture_sizes.sort()
+        self._init_candidates()
+
+    def _init_candidates(self) -> None:
+        """Build priority-ordered candidate lists for each token count."""
+        capture_sizes = self._capture_sizes
+        if not (self.cudagraph_mode and capture_sizes):
+            return
+
+        capture_sizes = sorted(capture_sizes)
+        decode_mode = self.cudagraph_mode.decode_mode()
+        mixed_mode = self.cudagraph_mode.mixed_mode()
+        separate_decode_routine = self.cudagraph_mode.separate_routine()
+
+        descs_by_token_count = defaultdict(list)
+        descs_by_mode = defaultdict(list)
+
+        for num_tokens in capture_sizes:
+            # Capture uniform decode specfifc graphs if required
+            #  (i.e. separate decode routine)
+            if separate_decode_routine and decode_mode:
+                for query_len in self.decode_query_lens:
+                    if (
+                        query_len <= num_tokens <= self.max_num_reqs * query_len
+                        and num_tokens % query_len == 0
+                    ):
+                        if (
+                            self._sm70_dflash2_tail_graphs
+                            and query_len < self.decode_query_len
+                            and num_tokens != query_len
+                        ):
+                            # Only single-request tails are admitted. Avoid
+                            # changing batching routes or multiplying captures.
+                            continue
+                        desc = BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_tokens // query_len,
+                            uniform_token_count=query_len,
+                        )
+                        descs_by_mode[decode_mode].append(desc)
+                        descs_by_token_count[num_tokens].append(desc)
+
+            if mixed_mode:
+                # for PIECEWISE graphs there is no limit on requests when replaying
+                # i.e. no request padding is needed
+                # so we leave it as None
+                num_reqs = (
+                    min(num_tokens, self.max_num_reqs)
+                    if mixed_mode == CUDAGraphMode.FULL
+                    else None
+                )
+                desc = BatchExecutionDescriptor(
+                    cg_mode=mixed_mode,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                )
+                descs_by_mode[mixed_mode].append(desc)
+                descs_by_token_count[num_tokens].append(desc)
+
+        if not descs_by_token_count:
+            return
+
+        sorted_padded = sorted(descs_by_token_count.keys())
+        self._candidates = [[] for _ in range(sorted_padded[-1] + 1)]
+
+        current_range_start = 0
+        for cg_size in sorted_padded:
+            for i in range(current_range_start, cg_size + 1):
+                self._candidates[i] = descs_by_token_count[cg_size]
+            current_range_start = cg_size + 1
+
+        for mode, descs in descs_by_mode.items():
+            descs.sort(key=lambda d: d.num_tokens, reverse=True)
+            self._capture_descs[mode] = descs
+
+    def needs_capture(self) -> bool:
+        return len(self._capture_descs) > 0
+
+    @torch.inference_mode()
+    def capture(
+        self,
+        create_forward_fn: Callable[
+            [BatchExecutionDescriptor],
+            tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState],
+        ],
+        progress_bar_desc: str = "Capturing CUDA graphs",
+    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
+        """Capture CUDA graphs.
+
+        Args:
+            create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
+                returns a tuple of (forward_fn, captured_attn_state).
+        """
+        captured_attn_states: dict[
+            BatchExecutionDescriptor, CapturedAttentionState
+        ] = {}
+        with graph_capture(device=self.device):
+            # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
+            # activations so FULL activations should fit in already allocated
+            # buffers in the graph pool.
+            for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
+                if mode not in self._capture_descs:
+                    continue
+
+                descs = self._capture_descs[mode]
+                if is_global_first_rank():
+                    descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
+                with sm70_decode_graph_compilation(mode == CUDAGraphMode.FULL):
+                    for desc in descs:
+                        # Prepare inputs and get forward function
+                        forward_fn, attn_state = create_forward_fn(desc)
+
+                        # Warmup
+                        forward_fn(CUDAGraphMode.NONE)
+
+                        # Capture
+                        logger.debug(
+                            "CG Capture: mode=%s, batch_desc=%s",
+                            desc.cg_mode.name,
+                            desc,
+                        )
+                        if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                            captured_attn_states[desc] = attn_state
+                            forward_fn(CUDAGraphMode.PIECEWISE)
+                        else:
+                            # Capture with fresh attention state. The warmup
+                            # attention state is discarded because some backends
+                            # (e.g. FlashMLA) perform lazy initializations that
+                            # must be captured in the graph.
+                            forward_fn, attn_state = create_forward_fn(desc)
+                            captured_attn_states[desc] = attn_state
+                            assert desc not in self.graphs, (
+                                f"Graph already captured for {desc}"
+                            )
+                            if (
+                                envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                                and _worker_device_is_pre_ampere()
+                            ):
+                                logger.info_once(
+                                    "Running SM70 Flash-V100 compile full-graph "
+                                    "pre-capture warmup for stable replay."
+                                )
+                                get_offloader().sync_prev_onload()
+                                forward_fn(CUDAGraphMode.NONE)
+                                get_offloader().join_after_forward()
+                                torch.accelerator.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            # Sync offloader's copy stream before capture.
+                            # Finish any pre-capture offloader prefetches.
+                            get_offloader().sync_prev_onload()
+                            with torch.cuda.graph(graph, self.pool):
+                                forward_fn(CUDAGraphMode.NONE)
+                                # Join offloader's copy stream after forward to avoid
+                                # unjoined stream error. The last layer's start_prefetch
+                                # forks copy_stream, but wait_prefetch only happens in
+                                # the next forward pass.
+                                get_offloader().join_after_forward()
+                            self.graphs[desc] = graph
+                            compilation_counter.num_cudagraph_captured += 1
+        self._graphs_captured = True
+        return captured_attn_states
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+    ) -> BatchExecutionDescriptor:
+        """Find matching cudagraph descriptor from priority-ordered candidates."""
+        if self._graphs_captured and 0 < num_tokens < len(self._candidates):
+            for desc in self._candidates[num_tokens]:
+                if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
+                    return desc
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
+        )
+
+    def run_fullgraph(self, desc: BatchExecutionDescriptor):
+        """Replay a captured FULL cudagraph."""
+        assert desc.cg_mode == CUDAGraphMode.FULL, (
+            f"Expected FULL mode, got {desc.cg_mode}"
+        )
+        assert desc in self.graphs, f"No cudagraph for {desc}"
+        # Sync offloader before replay - needed when transitioning from
+        # eager/piecewise to full cudagraph (e.g., prefill → decode).
+        # The previous eager iteration's start_prefetch may have queued
+        # H2D copies on copy_stream that the graph's captured events
+        # cannot see. Without this, replay could overwrite static buffers
+        # while those copies are still in flight.
+        get_offloader().sync_prev_onload()
+        self.graphs[desc].replay()
+
+
+class ModelCudaGraphManager(CudaGraphManager):
+    """CudaGraphManager with model-specific capture and hidden state management."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        cudagraph_mode: CUDAGraphMode,
+        decode_query_len: int,
+    ):
+        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+        # Used for FULL CUDA graphs. PW CUDA graphs do not use these.
+        self.hidden_states: torch.Tensor | None = None
+        self.aux_hidden_states: list[torch.Tensor] = []
+        self.use_aux_hidden_state_outputs = False
+        self.intermediate_tensors: IntermediateTensors | None = None
+        self._long_attention_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
+        from vllm.v1.attention.ops.sm70_e4m3_long import (
+            long_attention_enabled,
+            long_attention_graph_contract,
+            long_attention_max_batch_size,
+        )
+        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+            scalar_tail_attention_available,
+        )
+
+        if (
+            long_attention_enabled()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and self.dp_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        ):
+            # The served window decides the bound, not a literal: the operator's
+            # manifest only says what it was qualified for. A caller that carries
+            # no model config leaves the bound at the declared capability.
+            model_config = getattr(vllm_config, "model_config", None)
+            served = int(getattr(model_config, "max_model_len", 0) or 0)
+            context_limit, query_rows = long_attention_graph_contract(served or None)
+            max_batch_size = min(self.max_num_reqs, long_attention_max_batch_size())
+            if not _supports_sm70_long_batch_graphs(vllm_config):
+                max_batch_size = 1
+            if context_limit is not None:
+                if self._sm70_dflash2_tail_graphs and (
+                    bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                    or scalar_tail_attention_available()
+                ):
+                    query_rows = (1, *query_rows)
+                descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+                for desc in list(descs):
+                    single_request_variant = (
+                        desc.num_reqs == 1
+                        and desc.uniform_token_count in query_rows
+                        and desc.num_tokens == desc.uniform_token_count
+                    )
+                    # Reuse the same kernel and bound for request-major q8
+                    # batches only when the loaded native build admits them.
+                    batch_q8_variant = (
+                        desc.num_reqs is not None
+                        and 2 <= desc.num_reqs <= max_batch_size
+                        and 8 in query_rows
+                        and desc.uniform_token_count == 8
+                        and desc.num_tokens == desc.num_reqs * 8
+                    )
+                    if single_request_variant or batch_q8_variant:
+                        variant = replace(desc, attention_context_bucket=context_limit)
+                        self._long_attention_graphs[desc] = variant
+                        descs.append(variant)
+                logger.info_once(
+                    "SM70 E4M3 long-context graph variants captured at bound=%d "
+                    "for query rows %s and q8 batch capacity=%d (served window=%s).",
+                    context_limit,
+                    tuple(query_rows),
+                    max_batch_size,
+                    served or "unknown",
+                    scope="process",
+                )
+
+    def select_attention_graph(
+        self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
+    ) -> BatchExecutionDescriptor:
+        variant = self._long_attention_graphs.get(desc)
+        if variant is None or variant not in self.graphs:
+            return desc
+        # Never materialize device lengths on the host. A missing or oversized
+        # CPU hint conservatively selects the existing full-context graph.
+        if (
+            cpu_upper_bounds.device.type != "cpu"
+            or cpu_upper_bounds.ndim != 1
+            or desc.num_reqs is None
+            or not 0 < cpu_upper_bounds.numel() <= desc.num_reqs
+        ):
+            return desc
+        # Hints are per live request; the captured graph can pad the remainder.
+        # Inspect every request so an over-capacity peer cannot enter the route.
+        upper = int(cpu_upper_bounds.max())
+        limit = variant.attention_context_bucket
+        if limit is None:
+            return desc
+        if desc.uniform_token_count == 1 and upper * 2 < limit:
+            # The compact scalar route is admitted for long-context tails only.
+            # "Long" is half the captured bound rather than a literal, so a
+            # different served window keeps the same behaviour.
+            return desc
+        if 0 < upper <= limit:
+            if desc.num_reqs > 1:
+                logger.info_once(
+                    "SM70 long q8 attention graph replay selected: "
+                    "requests=%d bound=%d.",
+                    desc.num_reqs,
+                    limit,
+                    scope="process",
+                )
+            return variant
+        return desc
+
+    def capture(
+        self,
+        model: nn.Module,
+        model_state: ModelState,
+        input_buffers: InputBuffers,
+        intermediate_tensors: IntermediateTensors | None,
+        block_tables: BlockTables,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        has_lora: bool = False,
+        use_aux_hidden_state_outputs: bool = False,
+        progress_bar_desc: str = "Capturing CUDA graphs",
+    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
+        """Capture CUDA graphs for model forward pass."""
+        self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+
+        def create_forward_fn(
+            desc: BatchExecutionDescriptor,
+        ) -> tuple[
+            Callable[[CUDAGraphMode], None],
+            CapturedAttentionState,
+        ]:
+            num_tokens = desc.num_tokens
+            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            num_tokens_across_dp = (
+                torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
+                if self.dp_size > 1
+                else None
+            )
+
+            model_inputs = {
+                "input_ids": input_buffers.input_ids[:num_tokens],
+                "positions": input_buffers.positions[:num_tokens],
+                **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
+            }
+            if not self.is_first_pp_rank:
+                # Update for non-first PP ranks.
+                model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
+                assert intermediate_tensors is not None
+                model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+
+            attn_metadata, slot_mappings = prepare_inputs_to_capture(
+                num_reqs,
+                num_tokens,
+                model_state,
+                input_buffers,
+                block_tables,
+                attn_groups,
+                kv_cache_config,
+                skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+            )
+
+            def forward_fn(cg_mode: CUDAGraphMode) -> None:
+                batch_descriptor = None
+                if (
+                    cg_mode == CUDAGraphMode.PIECEWISE
+                    or desc.attention_context_bucket is not None
+                ):
+                    if cg_mode == CUDAGraphMode.PIECEWISE:
+                        assert attn_metadata is None
+                    batch_descriptor = BatchDescriptor(
+                        num_tokens=num_tokens,
+                        has_lora=has_lora,
+                        attention_context_bucket=desc.attention_context_bucket,
+                    )
+                with (
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens,
+                        cudagraph_runtime_mode=cg_mode,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        slot_mapping=slot_mappings,
+                        batch_descriptor=batch_descriptor,
+                    ),
+                ):
+                    model_output = model(**model_inputs)
+
+                if cg_mode == CUDAGraphMode.PIECEWISE:
+                    # PW CUDA graph internally handles the model outputs.
+                    # No need to keep track of the hidden states.
+                    return None
+
+                if self.is_last_pp_rank:
+                    # Last PP rank (common case).
+                    if self.use_aux_hidden_state_outputs:
+                        hidden_states, aux_hidden_states = model_output
+                    else:
+                        hidden_states = model_output
+                        aux_hidden_states = []
+                    if self.hidden_states is None:
+                        self.hidden_states = torch.empty_like(hidden_states)
+                    self.hidden_states[:num_tokens] = hidden_states
+                    if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
+                        self.aux_hidden_states = [
+                            torch.empty_like(x) for x in aux_hidden_states
+                        ]
+                    for i, aux in enumerate(aux_hidden_states):
+                        self.aux_hidden_states[i][:num_tokens] = aux
+                else:
+                    # Non-last PP rank.
+                    assert isinstance(model_output, IntermediateTensors)
+                    intermediate_tensors = model_output
+                    if self.intermediate_tensors is None:
+                        self.intermediate_tensors = IntermediateTensors.empty_like(
+                            intermediate_tensors
+                        )
+                    for k, v in intermediate_tensors.tensors.items():
+                        self.intermediate_tensors[k][:num_tokens] = v
+
+            return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
+
+        return super().capture(create_forward_fn, progress_bar_desc)
+
+    def run_fullgraph(
+        self, desc: BatchExecutionDescriptor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
+        """Replay a captured FULL cudagraph and return hidden states."""
+        super().run_fullgraph(desc)
+        if not self.is_last_pp_rank:
+            assert self.intermediate_tensors is not None
+            return self.intermediate_tensors[: desc.num_tokens]
+
+        assert self.hidden_states is not None
+        hidden_states = self.hidden_states[: desc.num_tokens]
+        if not self.use_aux_hidden_state_outputs:
+            return hidden_states
+        return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+
+
+def prepare_inputs_to_capture(
+    num_reqs: int,
+    num_tokens: int,
+    model_state: ModelState,
+    input_buffers: InputBuffers,
+    block_tables: BlockTables,
+    attn_groups: list[list[AttentionGroup]],
+    kv_cache_config: KVCacheConfig,
+    skip_attn: bool = False,
+) -> CapturedAttentionState:
+    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    slot_mappings_by_layer = build_slot_mappings_by_layer(
+        slot_mappings, kv_cache_config
+    )
+
+    # HACK(woosuk): Special handling for DCP.
+    if block_tables.cp_size > 1:
+        prepare_dcp_local_seq_lens(
+            input_buffers.dcp_local_seq_lens,
+            input_batch.seq_lens,
+            num_reqs,
+            block_tables.cp_size,
+            block_tables.cp_rank,
+            block_tables.cp_interleave,
+        )
+        input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
+
+    attn_metadata = None
+    if not skip_attn:
+        attn_metadata = model_state.prepare_attn(
+            input_batch,
+            CUDAGraphMode.NONE,
+            input_block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=True,
+        )
+    return CapturedAttentionState(attn_metadata, slot_mappings_by_layer)

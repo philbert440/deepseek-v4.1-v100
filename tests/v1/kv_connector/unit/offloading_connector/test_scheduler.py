@@ -1,0 +1,1875 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Iterable
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    generate_store_output,
+    to_keys,
+)
+from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GroupOffloadConfig,
+    OffloadingConnectorScheduler,
+    RequestOffloadState,
+    SchedulerOffloadConfig,
+)
+from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    OffloadingEvent,
+    OffloadingManager,
+    OffloadPolicy,
+    ReqContext,
+    RequestOffloadingContext,
+    get_offload_block_hash,
+)
+from vllm.v1.request import RequestStatus
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_offloading_connector(request_runner, async_scheduling: bool):
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # 3 blocks, store just the middle block (skip first and last)
+    # blocks = [0, 1, 2], [3, 4, 5], [6, 7, 8]
+    runner.new_request(token_ids=[0] * offloaded_block_size * 3)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(list(keys)[1:2])
+    )
+    runner.run(decoded_tokens=[0])
+
+    # add block missing 1 token -> no offload
+    runner.run(
+        decoded_tokens=[0] * (offloaded_block_size - 1),
+        expected_stored=(3, 4, 5),
+    )
+    runner.manager.touch.assert_not_called()
+
+    # +1 token -> single block, fail prepare_store
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: None
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.assert_called()
+
+    # 1 more block (+ token for async scheduling)
+    # now set block_hashes_to_store = []
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[0] * (offloaded_block_size + 1))
+
+    # 1 more block (+ token for kicking off offloading)
+    # now check touch was called with all 6 blocks
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0] * (offloaded_block_size + 1),
+        expected_stored=(15, 16, 17),
+    )
+    runner.manager.touch.assert_called()
+    block_hashes1 = list(runner.manager.touch.call_args.args[0])
+    assert len(block_hashes1) == 6
+
+    # terminate request
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    # create a new request differing only on the last token
+    runner.new_request(token_ids=[0] * (offloaded_block_size * 6 - 1) + [1])
+    runner.run(decoded_tokens=[0])
+    runner.manager.touch.assert_called()
+    block_hashes2 = list(runner.manager.touch.call_args.args[0])
+    assert len(block_hashes2) == 6
+
+    # verify hashes are the same, except for the last block
+    assert block_hashes1[:5] == block_hashes2[:5]
+    assert block_hashes1[5] != block_hashes2[5]
+
+    # terminate request
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=tuple(range(6 * block_size_factor)),
+    )
+
+    # full_block_tokens - num_computed_tokens < offloaded_block_size
+    runner.new_request(
+        token_ids=[0] * block_size + [1] * (offloaded_block_size - block_size)
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.manager.lookup.assert_not_called()
+
+    # single block lookup with no hits
+    runner.new_request(token_ids=[1] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.manager.lookup.assert_called_once()
+
+    # single block lookup with a hit
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    # single block lookup with a hit in a middle block
+    runner.new_request(
+        token_ids=[0] * offloaded_block_size * 2 + [1] * offloaded_block_size
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(3, 4, 5))
+
+    # test take_events
+    def to_hashes(int_hashes: list[int]) -> list[BlockHash]:
+        return [BlockHash(str(i).encode()) for i in int_hashes]
+
+    def take_events() -> Iterable[OffloadingEvent]:
+        yield OffloadingEvent(keys=to_keys([1, 2, 3]), medium="A", removed=False)
+        yield OffloadingEvent(keys=to_keys([4, 5, 6]), medium="B", removed=True)
+
+    runner.manager.take_events.side_effect = take_events
+    events = list(runner.scheduler_connector.take_events())
+    assert len(events) == 2
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == to_hashes([1, 2, 3])
+    assert event.block_size == 0
+    assert event.medium == "A"
+    assert event.token_ids == []
+    assert event.parent_block_hash is None
+    assert event.lora_id is None
+    assert event.lora_name is None
+    event = events[1]
+    assert isinstance(event, BlockRemoved)
+    assert event.block_hashes == to_hashes([4, 5, 6])
+    assert event.medium == "B"
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_request_preemption(request_runner, async_scheduling: bool):
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    free_block_queue = runner.scheduler.kv_cache_manager.block_pool.free_block_queue
+    num_free_blocks_empty = free_block_queue.num_free_blocks
+
+    # 2 blocks, store all, without flushing
+    # blocks = [0, 1, 2], [3, 4, 5]
+    runner.new_request(token_ids=[0] * offloaded_block_size * 2)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0],
+        complete_transfers=False,
+    )
+
+    # decode 2 more blocks - 1 gpu block, storing [6, 7, 8] (no flush)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0] * (2 * offloaded_block_size - block_size),
+        complete_transfers=False,
+    )
+
+    # simulate KV cache running out of space
+    free_block_queue.num_free_blocks = 0
+
+    # request should be preempted now
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+        expected_flushed=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        expected_stored=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+    # restore KV cache space and reset GPU prefix cache
+    free_block_queue.num_free_blocks = num_free_blocks_empty
+    runner.scheduler.reset_prefix_cache()
+
+    # request should now return from preemption
+    # re-load [0, ..., 8] from the CPU and store [9, 10, 11]
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0] * block_size,
+        expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(9, 10, 11),
+    )
+
+    # All stores completed before request_finished -> fence index empty.
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling: bool):
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # store 1 blocks
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    # With sync scheduling, all-finished flush fires within this run.
+    # With async scheduling, the finish is delayed so flush fires later.
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2) if not async_scheduling else (),
+    )
+
+    # start a request to load the first block, but don't complete
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+
+    # request triggered a load
+    transfer_jobs = list(runner.offloading_spec.handler.transfer_specs)
+    assert transfer_jobs
+
+    # start a new request to load the same first block
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+
+    # request did not trigger a load
+    assert transfer_jobs == list(runner.offloading_spec.handler.transfer_specs)
+
+    # complete transfers
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(0, 1, 2),
+    )
+
+    # second request will use the GPU prefix cache
+    assert transfer_jobs == list(runner.offloading_spec.handler.transfer_specs)
+
+    # Fence index drained: stores completed before request_finished ran.
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_abort_loading_requests(request_runner, async_scheduling: bool):
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # store 1 blocks
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2) if not async_scheduling else (),
+    )
+
+    # start a request to load the first block, but don't complete
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+
+    # request triggered a load
+    transfer_jobs = list(runner.offloading_spec.handler.transfer_specs)
+    assert transfer_jobs
+
+    # abort request
+    req_id = str(runner.req_id)
+    runner.scheduler.finish_requests((req_id,), RequestStatus.FINISHED_ABORTED)
+
+    # verify request is not deleted
+    assert req_id in runner.scheduler.requests
+
+    # complete loading request
+    runner.run(
+        decoded_tokens=[],
+        expected_loaded=(0, 1, 2),
+        expected_flushed=(0, 1, 2),
+    )
+
+    # assert request is deleted
+    assert req_id not in runner.scheduler.requests
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bool):
+    block_size = 4
+    num_gpu_blocks = 100
+    # sliding_window=8 -> 2 offloaded blocks (block_size_factor=1)
+    sliding_window = 8
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Verify group configs: group 0 = full attention, group 1 = sliding window
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert len(kv_group_configs) == 2
+    assert kv_group_configs[0].sliding_window_size_in_blocks is None
+    assert kv_group_configs[1].sliding_window_size_in_blocks == 2
+
+    # Blocks [0, 1, 2] miss
+    runner.new_request(token_ids=[0] * block_size * 3)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    # _touch called from get_num_new_matched_tokens (2 groups) and
+    # _get_reqs_to_store (2 groups) → 4 touch calls total.
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 4
+    assert len(touch_calls[0].args[0]) == 3
+    assert len(touch_calls[1].args[0]) == 3
+    assert len(touch_calls[2].args[0]) == 3
+    assert len(touch_calls[3].args[0]) == 3
+
+    # store 3 more block
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0] * (block_size * 3 + 2),
+        expected_stored=(0, 1, 2, 3, 4, 5),
+    )
+
+    # touch called from _get_reqs_to_store * 3 blocks, once for each group
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 6
+
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    runner.scheduler.reset_prefix_cache()
+
+    # full 3 blocks hit [0, 1, 2]
+    runner.new_request(token_ids=[0] * (block_size * 3 + 1))
+    runner.manager.lookup.return_value = True
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
+        # Group 1 (sliding window, window=2): only the last 2 blocks
+        #   are within the window → loads blocks 1,2
+        expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
+    )
+
+    # one touch in get_num_new_matched_tokens x 2 groups
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 2
+    # full attention group touched all 3 blocks
+    assert len(touch_calls[0].args[0]) == 3
+    # sliding window group touched just the last 2 blocks
+    assert len(touch_calls[1].args[0]) == 2
+
+    # 3 blocks are hit on GPU [0, 1, 2]
+    # 1 block loaded [3,]
+    runner.new_request(token_ids=[0] * (block_size * 4 + 1))
+    runner.manager.lookup.return_value = True
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0 (full attn): prefix lookup hits 3 → loads blocks 0,1,2
+        # Group 1 (sliding window, window=2): only the last 2 blocks
+        #   are within the window → loads blocks 1,2
+        expected_loaded=((0, 3), (1, 3)),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool):
+    hash_block_size = 4
+    num_gpu_blocks = 100
+
+    # Group 0: block_size=12 (offloaded_block_size=12)
+    # Group 1: block_size=16 (offloaded_block_size=16)
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=hash_block_size * 3,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            FullAttentionSpec(
+                block_size=hash_block_size * 4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=hash_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Verify group configs
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert len(kv_group_configs) == 2
+    assert kv_group_configs[0].gpu_block_size == 12
+    assert kv_group_configs[0].offloaded_block_size == 12
+    assert kv_group_configs[1].gpu_block_size == 16
+    assert kv_group_configs[1].offloaded_block_size == 16
+
+    # Prompt: 25 tokens, unaligned to both block sizes.
+    # Group 0 blocks: [0, 1], ending_token_offset = 24
+    # Group 1 blocks: [0,], ending_token_offset = 16
+    runner.new_request(token_ids=[0] * 25)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    # _touch called from get_num_new_matched_tokens (2 groups) and
+    # _get_reqs_to_store (2 groups) → 4 touch calls total.
+    # Group 0 has 2 offload keys, group 1 has 1.
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 4
+    assert len(touch_calls[0].args[0]) == 2
+    assert len(touch_calls[1].args[0]) == 1
+    assert len(touch_calls[2].args[0]) == 2
+    assert len(touch_calls[3].args[0]) == 1
+
+    # Get to 31 tokens
+    # No further blocks offloaded
+    runner.run(decoded_tokens=[0] * 6, expected_stored=((0, 0), (0, 1), (1, 0)))
+
+    # Get to 32 tokens
+    # Group 0 blocks: [0, 1], ending_token_offset = 24
+    # Group 1 blocks: [0, 1], ending_token_offset = 32
+    runner.run(decoded_tokens=[0])
+    # _get_reqs_to_store touch: only group 1 has a new block to store
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 2
+    assert len(touch_calls[0].args[0]) == 2
+    assert len(touch_calls[1].args[0]) == 2
+
+    # Get to 35 tokens
+    # No further blocks offloaded
+    runner.run(decoded_tokens=[0] * 3, expected_stored=((1, 1),))
+
+    # Get to 36 tokens
+    # Group 0 blocks: [0, 1, 2], ending_token_offset = 36
+    # Group 1 blocks: [0, 1], ending_token_offset = 32
+    runner.run(decoded_tokens=[0])
+    # _get_reqs_to_store touch: only group 0 has a new block to store
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 2
+    assert len(touch_calls[0].args[0]) == 3
+    assert len(touch_calls[1].args[0]) == 2
+
+    # Get to 47 tokens
+    # No further blocks offloaded
+    runner.run(decoded_tokens=[0] * 11, expected_stored=((0, 2),))
+
+    # Get to 48 tokens
+    # Group 0 blocks: [0, 1, 2, 3], ending_token_offset = 4
+    # Group 1 blocks: [0, 1, 2], ending_token_offset = 48
+    runner.run(decoded_tokens=[0])
+    # _get_reqs_to_store touch: both groups have a new block, each with 1 key
+    touch_calls = runner.manager.touch.call_args_list
+    assert len(touch_calls) == 2
+    assert len(touch_calls[0].args[0]) == 4
+    assert len(touch_calls[1].args[0]) == 3
+
+    runner.run(decoded_tokens=[0], expected_stored=((0, 3), (1, 2)))
+
+    # Get to 96 tokens
+    runner.run(
+        decoded_tokens=[0] * 47 + [EOS_TOKEN_ID],
+        expected_stored=((0, 4), (0, 5), (0, 6), (0, 7), (1, 3), (1, 4), (1, 5)),
+    )
+
+    runner.scheduler.reset_prefix_cache()
+
+    # Request with 48 matching tokens
+    # will match 48 tokens (4 block) from the first group
+    # 48 tokens (3 block) from the second group
+    # Total 48 tokens can be loaded
+    runner.new_request(token_ids=[0] * 48)
+    runner.manager.lookup.return_value = True
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(
+        decoded_tokens=[0],
+        expected_loaded=((0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)),
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    # Request with 48+37 matching tokens
+    # 48 tokens will be hit on GPU
+    # extra 32 tokens will be loaded
+    # extra tokens [0, 36] (blocks [4, 5, 6]) from the first group
+    # extra tokens [0, 32] (block [3, 4]) from the second group
+    runner.new_request(token_ids=[0] * (48 + 37))
+    runner.manager.lookup.return_value = True
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(
+        decoded_tokens=[0],
+        expected_loaded=((0, 4), (0, 5), (0, 6), (1, 3), (1, 4)),
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _maximal_prefix_lookup / _sliding_window_lookup
+# ---------------------------------------------------------------------------
+
+
+def _make_scheduler_with_lookup(
+    lookup_results: dict[int, bool | None],
+) -> OffloadingConnectorScheduler:
+    """Create an OffloadingConnectorScheduler with a mocked manager.lookup."""
+    manager = MagicMock(spec=OffloadingManager)
+    manager.lookup.side_effect = lambda key, req_context: lookup_results.get(
+        int(get_offload_block_hash(key).decode()), False
+    )
+
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = manager
+    return scheduler
+
+
+_EMPTY_REQ_CTX = ReqContext(req_id="")
+
+
+class TestMaximalPrefixLookup:
+    def test_all_hit(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: True})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 2
+
+    def test_all_miss(self):
+        sched = _make_scheduler_with_lookup({})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 0
+
+    def test_partial_prefix(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: True})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3]), _EMPTY_REQ_CTX) == 2
+
+    def test_miss_then_hit(self):
+        sched = _make_scheduler_with_lookup({2: True})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 0
+
+    def test_single_hit(self):
+        sched = _make_scheduler_with_lookup({1: True})
+        assert sched._maximal_prefix_lookup(to_keys([1]), _EMPTY_REQ_CTX) == 1
+
+    def test_empty(self):
+        sched = _make_scheduler_with_lookup({})
+        assert sched._maximal_prefix_lookup([], _EMPTY_REQ_CTX) == 0
+
+    def test_none_defers(self):
+        sched = _make_scheduler_with_lookup({1: None, 2: True})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+
+    def test_none_after_hit_defers(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: None})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+
+    def test_none_stops_at_miss(self):
+        """None is treated as hit for iteration, but miss stops the scan."""
+        sched = _make_scheduler_with_lookup({1: None, 2: False, 3: True})
+        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3]), _EMPTY_REQ_CTX) is None
+        # lookup should have been called for blocks 1 and 2 (stops at miss)
+        assert sched.manager.lookup.call_count == 2
+
+
+class TestSlidingWindowLookup:
+    def test_all_hit_exact_window(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: True})
+        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) == 2
+
+    def test_all_miss(self):
+        sched = _make_scheduler_with_lookup({})
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 1, _EMPTY_REQ_CTX) == 0
+
+    def test_window_at_end(self):
+        sched = _make_scheduler_with_lookup({2: True, 3: True})
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 2, _EMPTY_REQ_CTX) == 3
+
+    def test_window_in_middle(self):
+        sched = _make_scheduler_with_lookup({2: True, 3: True})
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), 2, _EMPTY_REQ_CTX) == 3
+        )
+
+    def test_no_full_window_falls_back_to_prefix(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: True})
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) == 2
+
+    def test_single_block_window(self):
+        sched = _make_scheduler_with_lookup({2: True, 3: True})
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 1, _EMPTY_REQ_CTX) == 3
+
+    def test_gap_resets_consecutive(self):
+        sched = _make_scheduler_with_lookup({2: True, 3: True, 4: True})
+        # [1, 2, 3, 0, 4] — gap at 0 resets, window of 2 found at [2,3]
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 0, 4]), 2, _EMPTY_REQ_CTX)
+            == 3
+        )
+
+    def test_window_prefers_rightmost(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: True, 4: True, 5: True})
+        # two valid windows: [1,2] at positions 0-1 and [4,5] at positions 3-4
+        # scans right-to-left, finds [4,5] first
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4, 5]), 2, _EMPTY_REQ_CTX)
+            == 5
+        )
+
+    def test_prefix_fallback_with_gap(self):
+        sched = _make_scheduler_with_lookup({2: True, 3: True, 4: True, 5: True})
+        # window of 4 not found contiguously (gap at 1)
+        assert (
+            sched._sliding_window_lookup(to_keys([2, 1, 3, 4, 5]), 4, _EMPTY_REQ_CTX)
+            == 1
+        )
+
+    def test_empty(self):
+        sched = _make_scheduler_with_lookup({})
+        assert sched._sliding_window_lookup([], 1, _EMPTY_REQ_CTX) == 0
+
+    def test_none_defers(self):
+        sched = _make_scheduler_with_lookup({1: True, 2: None})
+        assert sched._sliding_window_lookup(to_keys([1, 2]), 2, _EMPTY_REQ_CTX) is None
+
+    def test_none_with_full_window_still_defers(self):
+        """Even if a real window is found after a None, result is deferred."""
+        # Scan right-to-left: 4(True), 3(None) resets, 2(True), 1(True) = window
+        # but block 3 was None so defer_lookup is set
+        sched = _make_scheduler_with_lookup({1: True, 2: True, 3: None, 4: True})
+        assert (
+            sched._sliding_window_lookup(to_keys([1, 2, 3, 4]), 2, _EMPTY_REQ_CTX)
+            is None
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling: bool):
+    """With REQUEST_LEVEL policy, all blocks are stored — including prefix hits."""
+    gpu_block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = gpu_block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size_factor=block_size_factor,
+        block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+    )
+
+    # Store 1 offloaded block (3 GPU blocks) via a normal request.
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2) if not async_scheduling else (),
+    )
+
+    # Reset GPU prefix cache so the next request must load from CPU.
+    runner.scheduler.reset_prefix_cache()
+
+    # Manager returns REQUEST_LEVEL for the next request.
+    runner.manager.on_new_request.return_value = RequestOffloadingContext(
+        policy=OffloadPolicy.REQUEST_LEVEL
+    )
+
+    # New request with 2 offloaded blocks; first matches what's in CPU.
+    runner.new_request(token_ids=[0] * offloaded_block_size * 2)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # Load the first offloaded block from CPU.
+    runner.run(decoded_tokens=[0], expected_loaded=(0, 1, 2))
+
+    # Store must include ALL 6 GPU blocks (both the loaded prefix and
+    # the newly computed block), not just the 3 new ones.
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2, 3, 4, 5))
+
+    # All stores completed before request_finished -> fence index empty.
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests for the per-job-store-completion design and fence invariants.
+# ---------------------------------------------------------------------------
+
+
+def _make_exact_boundary_scheduler() -> OffloadingConnectorScheduler:
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = SchedulerOffloadConfig(
+        kv_group_configs=(
+            GroupOffloadConfig(
+                group_idx=0,
+                gpu_block_size=16,
+                offloaded_block_size=16,
+                hash_block_size_factor=4,
+                sliding_window_size_in_blocks=None,
+            ),
+            GroupOffloadConfig(
+                group_idx=1,
+                gpu_block_size=16,
+                offloaded_block_size=16,
+                hash_block_size_factor=4,
+                sliding_window_size_in_blocks=1,
+                requires_exact_boundary_source=True,
+            ),
+        ),
+        block_size_factor=1,
+        num_workers=1,
+        offload_prompt_only=False,
+        num_kv_cache_groups=2,
+    )
+    scheduler._group_config_by_idx = {
+        group.group_idx: group for group in scheduler.config.kv_group_configs
+    }
+    scheduler.manager = MagicMock(spec=OffloadingManager)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(4)]
+    request.num_computed_tokens = 0
+    request.num_prompt_tokens = 16
+    request.num_tokens = 16
+    request.is_finished.return_value = False
+    req_context = ReqContext(req_id=request.request_id)
+    req_status = RequestOffloadState(
+        config=scheduler.config,
+        req=request,
+        req_context=req_context,
+        offloading_context=RequestOffloadingContext(),
+    )
+    req_status.update_offload_keys()
+    req_status.group_states[0].block_ids[:] = [11]
+    # This is the connector's stale append-only view of the Mamba table.
+    req_status.group_states[1].block_ids[:] = [21]
+
+    scheduler._req_status = {request.request_id: req_status}
+    scheduler._current_batch_load_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._blocks_being_loaded = set()
+    scheduler._job_counter = 0
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {}
+    scheduler._block_id_to_pending_jobs = {}
+    return scheduler
+
+
+def _hybrid_align_spec(
+    *,
+    block_size_factor: int = 1,
+    retention_interval: int | None = None,
+    with_mamba: bool = True,
+) -> SimpleNamespace:
+    block_size = 16
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+    ]
+    if with_mamba:
+        groups.append(
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            )
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    return SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=4),
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=retention_interval
+            ),
+        ),
+        kv_cache_config=kv_cache_config,
+        gpu_block_size=(block_size,) * len(groups),
+        block_size_factor=block_size_factor,
+        hash_block_size=block_size,
+        offload_prompt_only=False,
+    )
+
+
+def test_mamba_align_group_requires_exact_boundary_source():
+    config = SchedulerOffloadConfig.from_spec(_hybrid_align_spec())
+
+    assert not config.kv_group_configs[0].requires_exact_boundary_source
+    assert config.kv_group_configs[1].requires_exact_boundary_source
+
+
+@pytest.mark.parametrize("retention_interval", [0, 32])
+def test_sparse_retention_rejects_offloaded_block_size_factor(retention_interval):
+    # Sparse retention keeps Mamba states on the GPU block grid; boundary
+    # stores need offloaded-block alignment, so a factor above one would
+    # offload attention blocks without their Mamba state.
+    with pytest.raises(ValueError, match="block_size=32"):
+        SchedulerOffloadConfig.from_spec(
+            _hybrid_align_spec(
+                block_size_factor=2, retention_interval=retention_interval
+            )
+        )
+
+    # Factor one, dense retention, or no align Mamba group are all fine.
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(block_size_factor=1, retention_interval=retention_interval)
+    )
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(block_size_factor=2, retention_interval=None)
+    )
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(
+            block_size_factor=2,
+            retention_interval=retention_interval,
+            with_mamba=False,
+        )
+    )
+
+
+def _empty_store_output(**overrides):
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        boundary_state_offloads=None,
+    )
+    for name, value in overrides.items():
+        setattr(output, name, value)
+    return output
+
+
+def test_mamba_boundary_store_uses_exact_source_not_positional_mirror():
+    scheduler = _make_exact_boundary_scheduler()
+    output = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+
+    jobs = scheduler._build_boundary_state_store_jobs(output)
+
+    assert len(jobs) == 1
+    [job_id] = jobs
+    src_spec, _ = jobs[job_id].transfer_spec
+    assert isinstance(src_spec, GPULoadStoreSpec)
+    assert src_spec.block_ids.tolist() == [99]
+    assert src_spec.block_ids.tolist() != [21]
+    assert src_spec.group_sizes == [0, 1]
+    assert src_spec.block_indices == [0, 0]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+
+
+def test_normal_store_excludes_positional_mamba_align_source():
+    scheduler = _make_exact_boundary_scheduler()
+    output = _empty_store_output(
+        scheduled_new_reqs=[SimpleNamespace(req_id="req", block_ids=None)],
+        num_scheduled_tokens={"req": 16},
+    )
+
+    jobs = scheduler._build_store_jobs(output)
+
+    assert len(jobs) == 1
+    [job] = jobs.values()
+    src_spec, _ = job.transfer_spec
+    assert isinstance(src_spec, GPULoadStoreSpec)
+    assert src_spec.block_ids.tolist() == [11]
+    assert src_spec.group_sizes == [1, 0]
+    assert 21 not in src_spec.block_ids
+
+
+def test_mamba_boundary_store_flushes_before_source_block_reuse():
+    scheduler = _make_exact_boundary_scheduler()
+    first = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    first_meta = scheduler.build_connector_meta(first)
+    [job_id] = first_meta.store_jobs
+
+    second = _empty_store_output(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req"],
+            new_block_ids=[([12], [99])],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req": 0},
+    )
+    second_meta = scheduler.build_connector_meta(second)
+
+    assert second_meta.jobs_to_flush == {job_id}
+
+
+def test_mamba_boundary_store_retries_while_host_tier_is_busy():
+    # The core offers a boundary state once; with a few state slots per
+    # group the host tier can be fully pinned by in-flight transfers.
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None, None]
+    first = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+
+    assert scheduler.build_connector_meta(first).store_jobs == {}
+    req_status = scheduler._req_status["req"]
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    assert scheduler._block_id_to_pending_jobs == {}
+    assert req_status.transfer_jobs == set()
+
+    # Still busy on a step where the request is not scheduled at all.
+    req_status.req.num_computed_tokens = 16
+    idle = _empty_store_output()
+    assert scheduler.build_connector_meta(idle).store_jobs == {}
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    meta = scheduler.build_connector_meta(_empty_store_output())
+
+    [job_id] = meta.store_jobs
+    src_spec, _ = meta.store_jobs[job_id].transfer_spec
+    assert src_spec.block_ids.tolist() == [99]
+    assert src_spec.group_sizes == [0, 1]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+    assert req_status.pending_boundary_offloads == []
+    assert req_status.transfer_jobs == {job_id}
+    assert scheduler.manager.prepare_store.call_count == 3
+
+
+def test_mamba_boundary_reoffer_supersedes_pending_entry():
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None]
+    scheduler.build_connector_meta(
+        _empty_store_output(
+            num_scheduled_tokens={"req": 16},
+            boundary_state_offloads={"req": [(1, 99, 16)]},
+        )
+    )
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    scheduler._req_status["req"].req.num_computed_tokens = 16
+    meta = scheduler.build_connector_meta(
+        _empty_store_output(boundary_state_offloads={"req": [(1, 77, 16)]})
+    )
+
+    [job] = meta.store_jobs.values()
+    src_spec, _ = job.transfer_spec
+    assert src_spec.block_ids.tolist() == [77]
+    assert scheduler._req_status["req"].pending_boundary_offloads == []
+
+
+@pytest.mark.parametrize("how", ["preempted", "finished"])
+def test_pending_boundary_offloads_dropped_when_blocks_are_freed(how):
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None]
+    scheduler.build_connector_meta(
+        _empty_store_output(
+            num_scheduled_tokens={"req": 16},
+            boundary_state_offloads={"req": [(1, 99, 16)]},
+        )
+    )
+    req_status = scheduler._req_status["req"]
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    if how == "preempted":
+        meta = scheduler.build_connector_meta(
+            _empty_store_output(preempted_req_ids={"req"})
+        )
+        assert meta.store_jobs == {}
+        assert req_status.pending_boundary_offloads == []
+    else:
+        req_status.req.is_finished.return_value = True
+        assert scheduler.request_finished(req_status.req) == (False, None)
+        assert "req" not in scheduler._req_status
+        assert req_status.pending_boundary_offloads == []
+    # The freed source block must never be read by a late store.
+    assert scheduler._block_id_to_pending_jobs == {}
+
+
+def test_pending_job_cleanup_deduplicates_block_ids():
+    """MTP lookahead may alias a physical block within one completed job."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._block_id_to_pending_jobs = {7: {42}}
+
+    scheduler._remove_pending_job(42, [7, 7])
+
+    assert scheduler._block_id_to_pending_jobs == {}
+
+
+def test_loads_do_not_populate_fence_index(request_runner):
+    """Loads don't populate _block_id_to_pending_jobs (protected by
+    delay_free_blocks while in flight)."""
+    runner = request_runner(
+        block_size_factor=3,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 12)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.run(decoded_tokens=[], complete_transfers=False)
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+def test_fence_at_update_state_after_alloc(request_runner):
+    """A load reusing a finished request's pending-store block triggers
+    a flush via update_state_after_alloc's fence.
+
+    num_gpu_blocks=2 forces the BlockPool to give req2 the same block
+    req1 just freed.
+    """
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=2,
+        async_scheduling=False,
+    )
+
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        complete_transfers=False,
+        expected_stored=(0,),
+        expected_flushed=(0,),
+    )
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * 4)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+def test_fence_at_build_store_jobs(request_runner):
+    """A new prefill (no load -> update_state_after_alloc returns early)
+    reusing a finished request's pending-store block is flushed by
+    _build_store_jobs's fence."""
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=2,
+        async_scheduling=False,
+    )
+
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        complete_transfers=False,
+        expected_stored=(0,),
+        expected_flushed=(0,),
+    )
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[1] * 4)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 0
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+    )
+    assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
+    """complete_store fires per-job, not deferred to request finish.
+    Each call carries only that store's keys."""
+    gpu_block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = gpu_block_size * block_size_factor
+    runner = request_runner(
+        block_size_factor=block_size_factor,
+        block_size=gpu_block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+    )
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # First store: fires when block 0 is fully populated.
+    runner.run(decoded_tokens=[0, 0], expected_stored=(0, 1, 2))
+    assert runner.manager.complete_store.call_count == 1
+    first_call_keys = set(runner.manager.complete_store.call_args.args[0])
+    assert len(first_call_keys) == 1
+    runner.manager.complete_store.reset_mock()
+
+    # Second store: fires when block 1 is fully populated, with different keys.
+    runner.run(
+        decoded_tokens=[0] * (offloaded_block_size + 1),
+        expected_stored=(3, 4, 5),
+    )
+    assert runner.manager.complete_store.call_count == 1
+    second_call_keys = set(runner.manager.complete_store.call_args.args[0])
+    assert first_call_keys != second_call_keys
+    runner.manager.complete_store.reset_mock()
+
+    # Finish: no store pending -> no further call.
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    assert runner.manager.complete_store.call_count == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_max_offload_tokens_validation(request_runner, async_scheduling: bool):
+    """Validates max_offload_tokens: type coercion, boundary values, and capping.
+
+    Setup: 3 offloaded blocks × 3 GPU blocks each = 9 GPU block offsets (0–8).
+    """
+    gpu_block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = gpu_block_size * block_size_factor  # 12
+    num_gpu_blocks = 100
+    all_offsets = (0, 1, 2, 3, 4, 5, 6, 7, 8)
+
+    def make_runner():
+        return request_runner(
+            block_size=gpu_block_size,
+            num_gpu_blocks=num_gpu_blocks,
+            async_scheduling=async_scheduling,
+            block_size_factor=block_size_factor,
+        )
+
+    def setup(r, max_offload_tokens):
+        r.new_request(
+            token_ids=[0] * offloaded_block_size * 3,
+            kv_transfer_params={"max_offload_tokens": max_offload_tokens},
+        )
+        r.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+
+    # With sync scheduling, the connector flushes completed stores when the
+    # request finishes; async scheduling defers the flush to the next step.
+    flushed_all = all_offsets if not async_scheduling else ()
+    flushed_two = (0, 1, 2, 3, 4, 5) if not async_scheduling else ()
+
+    # None -> no cap, all 9 offsets stored
+    r = make_runner()
+    setup(r, None)
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=all_offsets,
+        expected_flushed=flushed_all,
+    )
+
+    # str -> warn and fall back to no cap
+    r = make_runner()
+    setup(r, "24")
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=all_offsets,
+        expected_flushed=flushed_all,
+    )
+
+    # float -> warn and fall back to no cap
+    r = make_runner()
+    setup(r, 24.5)
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=all_offsets,
+        expected_flushed=flushed_all,
+    )
+
+    # negative -> warn and fall back to no cap
+    r = make_runner()
+    setup(r, -1)
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=all_offsets,
+        expected_flushed=flushed_all,
+    )
+
+    # bool -> rejected (type(True) is bool, not int), falls back to no cap
+    r = make_runner()
+    setup(r, True)
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=all_offsets,
+        expected_flushed=flushed_all,
+    )
+
+    # zero -> valid, no blocks offloaded
+    r = make_runner()
+    setup(r, 0)
+    r.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=())
+
+    # positive int cap -> limits offload to first 2 offloaded blocks (offsets 0–5)
+    r = make_runner()
+    setup(r, 24)  # 24 tokens = 2 offloaded blocks × 12 tokens each
+    r.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2, 3, 4, 5),
+        expected_flushed=flushed_two,
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_offload_prompt_only(request_runner, async_scheduling: bool):
+    """offload_prompt_only=True offloads prompt blocks but never decode blocks.
+
+    Setup: a 2-offloaded-block prompt followed by enough decode tokens to fill
+    4 more offloaded blocks. The flag clamps the offloadable token count to the
+    prompt length, so only the prompt's blocks (GPU offsets 0-5) are ever
+    eligible for store; the decode blocks (offsets >= 6) are skipped.
+
+    The request is intentionally not terminated (no EOS): a store is only
+    flushed when a request finishes (or is preempted), so without a finish
+    there is nothing to flush and the assertion stays free of flush-timing
+    subtleties. The decode steps are still enough for the prompt store to
+    complete and show up in expected_stored.
+    """
+    gpu_block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = gpu_block_size * block_size_factor  # 12
+    num_prompt_blocks = 2
+    num_decode_blocks = 4
+    prompt_offsets = (0, 1, 2, 3, 4, 5)
+
+    runner = request_runner(
+        block_size=gpu_block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+        extra_config_overrides={"offload_prompt_only": True},
+    )
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner.new_request(token_ids=[0] * offloaded_block_size * num_prompt_blocks)
+    runner.run(
+        decoded_tokens=[0] * (offloaded_block_size * num_decode_blocks),
+        expected_stored=prompt_offsets,
+    )
+
+    # Timing-independent guard: only the prompt's blocks were ever offered for
+    # store. If decode blocks leaked through, more keys would appear here.
+    offered_keys = {
+        key
+        for call in runner.manager.prepare_store.call_args_list
+        for key in call.args[0]
+    }
+    assert len(offered_keys) == num_prompt_blocks
+
+
+def test_flush_all_jobs_when_no_requests_remain(request_runner):
+    """When all tracked requests are finished, build_connector_meta flushes
+    all pending jobs since there will be no future step to complete them."""
+    block_size = 4
+    block_size_factor = 1
+    offloaded_block_size = block_size * block_size_factor
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        block_size_factor=block_size_factor,
+    )
+
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        complete_transfers=False,
+        expected_stored=(0,),
+        expected_flushed=(0,),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_reset_cache(request_runner, async_scheduling: bool):
+    """reset_cache flushes in-flight loads, calls manager.reset_cache(), resets
+    next_stored_block_idx for active requests and clears job tracking."""
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # Store 1 offloaded block (3 GPU blocks) to CPU.
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2) if not async_scheduling else (),
+    )
+
+    # Reset GPU prefix cache then start a request that loads from CPU.
+    # Leave the load in-flight so that reset_cache must flush it.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[], complete_transfers=False)
+
+    # Capture in-flight load job IDs before reset.
+    load_job_ids = {
+        jid
+        for jid, status in runner.connector_scheduler._jobs.items()
+        if not status.is_store
+    }
+    assert load_job_ids, "expected in-flight load jobs before reset"
+
+    # Record job counter to verify the reset counter is set correctly.
+    job_counter_before_reset = runner.connector_scheduler._job_counter
+
+    # After update_state_after_alloc, next_stored_block_idx is advanced to
+    # skip the loaded prefix; reset_cache must bring it back to 0.
+    for req_status in runner.connector_scheduler._req_status.values():
+        for group_state in req_status.group_states:
+            assert group_state.next_stored_block_idx > 0
+
+    # Reset the cache
+    runner.connector_scheduler.reset_cache()
+
+    # manager.reset_cache() must be called exactly once.
+    runner.manager.reset_cache.assert_called_once()
+
+    # In-flight load jobs must be queued for flushing to prevent CUDA stream
+    # races between old loads and new post-reset stores.
+    assert load_job_ids <= runner.connector_scheduler._current_batch_jobs_to_flush
+
+    # All internal job tracking must be cleared.
+    assert not runner.connector_scheduler._jobs
+    assert not runner.connector_scheduler._block_id_to_pending_jobs
+    if runner.connector_scheduler._blocks_being_loaded is not None:
+        assert not runner.connector_scheduler._blocks_being_loaded
+
+    # Job reset counter must equal the job counter so that completions for
+    # pre-reset jobs arriving from workers are silently discarded.
+    assert runner.connector_scheduler._stale_job_threshold == job_counter_before_reset
+
+    # next_stored_block_idx must be reset to 0 for every active request so
+    # that post-reset stores restart from block 0.
+    for req_status in runner.connector_scheduler._req_status.values():
+        for group_state in req_status.group_states:
+            assert group_state.next_stored_block_idx == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_skip(request_runner, async_scheduling: bool):
+    """SWA blocks unreachable by the load path are skipped during store.
+
+    Simulates a DeepSeek V4-like hybrid architecture where SWA groups have
+    much smaller block sizes than the full-attention (MLA) group, causing
+    most SWA blocks to be unreachable by the alignment-based load path.
+
+    Setup:
+      - Group 0: full attention (MLA-like), block_size=16
+      - Group 1: SWA, block_size=4, sliding_window=8
+
+    alignment_block_count = 16 / 4 = 4 SWA blocks per alignment segment.
+    sliding_window_size_in_blocks = ceil(8 / 4) = 2.
+    Within each segment of 4 SWA blocks, only the trailing 2 are stored.
+
+    With 32 tokens (2 full-attn blocks, 8 SWA blocks):
+      - Group 0 stores: blocks 0, 1  (all full-attn blocks)
+      - Group 1 stores: blocks 2, 3, 6, 7  (skip 0,1,4,5)
+
+    For real DeepSeek V4 (100K tokens), this reduces SWA stores by ~78%.
+    """
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    # Verify config: alignment_block_count computed correctly
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert len(kv_group_configs) == 2
+    # Group 0: full attention -> no alignment skip
+    assert kv_group_configs[0].alignment_block_count is None
+    assert kv_group_configs[0].sliding_window_size_in_blocks is None
+    assert kv_group_configs[0].offloaded_block_size == full_attn_block_size
+    # Group 1: SWA -> alignment_block_count = 16/4 = 4, tail = 2
+    assert kv_group_configs[1].alignment_block_count == 4
+    assert kv_group_configs[1].sliding_window_size_in_blocks == 2
+    assert kv_group_configs[1].offloaded_block_size == swa_block_size
+
+    # Send 32 tokens = 2 full-attn blocks (block_size=16) = 8 SWA blocks
+    # (block_size=4). Decode 1 token to kick off processing (stores are
+    # deferred to next step).
+    num_tokens = 32
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+
+    # Decode 1 more token to complete the deferred stores from above.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0 (full attn, block_size=16): 2 offloaded blocks
+        #   -> GPU blocks (0, 0) and (0, 1)
+        # Group 1 (SWA, block_size=4): 8 offloaded blocks, skip first 2
+        #   per segment of 4:
+        #   Segment 0 (blocks 0-3): skip 0,1 -> store (1, 2), (1, 3)
+        #   Segment 1 (blocks 4-7): skip 4,5 -> store (1, 6), (1, 7)
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (1, 2),
+            (1, 3),
+            (1, 6),
+            (1, 7),
+        ),
+    )
+
+    # Verify that loads still work correctly for the stored SWA blocks.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * num_tokens + [1])
+    runner.manager.lookup.return_value = True
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 2
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0: full prefix lookup hits 2 offloaded blocks
+        #   -> loads GPU blocks (0, 0), (0, 1)
+        # Group 1: sliding window lookup finds trailing 2 from last segment
+        #   (blocks 6, 7 which were stored)
+        #   -> loads GPU blocks (1, 6), (1, 7)
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (1, 6),
+            (1, 7),
+        ),
+    )
+
+
+def _make_scratch_scheduler(*, full_attention_only=False):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+    kv_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring"],
+                CircularBufferSpec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                )
+                if not full_attention_only
+                else FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+        ],
+    )
+    config = MagicMock()
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.world_size = 1
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = None
+    config.kv_transfer_config.kv_connector_extra_config = {"offload_prompt_only": False}
+    spec = MockOffloadingSpec(config, kv_config)
+    scheduler = OffloadingConnectorScheduler(spec)
+    scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(keys)
+    )
+    req = MagicMock()
+    req.request_id = "scratch"
+    req.kv_transfer_params = None
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(4)]
+    req.num_computed_tokens = 0
+    req.num_prompt_tokens = req.num_tokens = 16
+    req.shared_prefix_boundary = 0
+    req.is_finished.return_value = False
+    scheduler.on_new_request(req)
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    state.update_block_id_groups(([11], [31], [21]))
+    return scheduler, req, spec
+
+
+def test_scratch_group_config_and_keys_preserve_original_indices():
+    scheduler, req, spec = _make_scratch_scheduler()
+    assert spec.gpu_block_size == (16, 4, 16)
+    assert [g.group_idx for g in scheduler.config.kv_group_configs] == [0, 2]
+    assert scheduler._lookup_groups == (0, 2)
+    state = scheduler._req_status[req.request_id]
+    assert len(state.group_states) == 3
+    assert state.group_states[1].offload_keys == []
+    assert len(state.group_states[2].offload_keys) == 1
+    assert scheduler.config.kv_group_configs[1].requires_exact_boundary_source
+
+
+def test_scratch_group_normal_store_keeps_full_worker_layout():
+    scheduler, req, _ = _make_scratch_scheduler()
+    jobs = scheduler._build_store_jobs(
+        _empty_store_output(
+            scheduled_new_reqs=[SimpleNamespace(req_id=req.request_id, block_ids=None)],
+            num_scheduled_tokens={req.request_id: 16},
+        )
+    )
+    [job] = jobs.values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [11]
+    assert src.group_sizes == [1, 0, 0]
+    assert src.block_indices == [0, 0, 0]
+
+
+def test_scratch_group_boundary_store_keeps_source_and_fence():
+    scheduler, req, _ = _make_scratch_scheduler()
+    jobs = scheduler._build_boundary_state_store_jobs(
+        _empty_store_output(
+            num_scheduled_tokens={req.request_id: 16},
+            boundary_state_offloads={req.request_id: [(2, 99, 16)]},
+        )
+    )
+    [(job_id, job)] = jobs.items()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [99]
+    assert src.group_sizes == [0, 0, 1]
+    assert src.block_indices == [0, 0, 0]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+
+
+def test_scratch_group_load_keeps_full_worker_layout():
+    scheduler, req, _ = _make_scratch_scheduler()
+    blocks = SimpleNamespace(
+        blocks=tuple(
+            [SimpleNamespace(block_id=i, is_null=False, block_hash=None)]
+            for i in (11, 31, 21)
+        )
+    )
+    scheduler.update_state_after_alloc(req, blocks, 16)
+    [job] = scheduler._current_batch_load_jobs.values()
+    _, dst = job.transfer_spec
+    assert dst.block_ids.tolist() == [11, 21]
+    assert dst.group_sizes == [1, 0, 1]
+    assert dst.block_indices == [0, 0, 0]
+
+
+def test_scratch_group_lookup_and_touch_skip_ring():
+    scheduler, req, _ = _make_scratch_scheduler()
+    req.num_tokens = 17
+    scheduler.manager.lookup.return_value = True
+    state = scheduler._req_status[req.request_id]
+    assert scheduler._lookup(state) == 16
+    scheduler._touch(state)
+    assert not state.group_states[1].offload_keys
+    state.advance_stored_idx(16)
+    state.update_num_hit_blocks(16)
+    assert state.group_states[1].num_hit_blocks == 0
+    assert state.group_states[2].num_hit_blocks == 1
+
+
+@pytest.mark.parametrize("resolved_hash", [4, 16])
+def test_scratch_group_explicit_offload_block_size(monkeypatch, resolved_hash):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+
+    _, _, original = _make_scratch_scheduler()
+    config = original.vllm_config
+    config.kv_transfer_config.kv_connector_extra_config["block_size"] = 32
+    # Exercise the offload contract independently of core hash-size policy.
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.base.resolve_kv_cache_block_sizes",
+        lambda *_: (16, resolved_hash),
+    )
+    spec = MockOffloadingSpec(config, original.kv_cache_config)
+    assert spec.block_size_factor == 2
+    assert spec.gpu_block_size == (16, 4, 16)
+
+
+def test_cacheable_misalignment_still_rejected(monkeypatch):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+
+    _, _, original = _make_scratch_scheduler()
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.base.resolve_kv_cache_block_sizes", lambda *_: (32, 32)
+    )
+    with pytest.raises(AssertionError, match="not divisible"):
+        MockOffloadingSpec(original.vllm_config, original.kv_cache_config)
+
+
+@pytest.mark.parametrize("blocked_group", [0, 2])
+def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
+    from vllm.v1.kv_offload.base import make_offload_key
+    from vllm.v1.kv_offload.cpu.manager import (
+        CPUOffloadingManager,
+        GroupedCPUOffloadingManager,
+    )
+
+    scheduler, req, _ = _make_scratch_scheduler(full_attention_only=True)
+    manager = GroupedCPUOffloadingManager({g: CPUOffloadingManager(1) for g in (0, 2)})
+    scheduler.manager = manager
+    state = scheduler._req_status[req.request_id]
+    ctx = state.req_context
+    pinned = make_offload_key(b"pinned", blocked_group)
+    manager.prepare_store([pinned], ctx)
+    manager.complete_store([pinned], ctx)
+    manager.prepare_load([pinned], ctx)
+    output = _empty_store_output(
+        scheduled_new_reqs=[SimpleNamespace(req_id=req.request_id, block_ids=None)],
+        num_scheduled_tokens={req.request_id: 16},
+    )
+    assert scheduler._build_store_jobs(output) == {}
+    assert all(s.next_stored_block_idx == 0 for s in state.group_states)
+    manager.complete_load([pinned], ctx)
+    [job] = scheduler._build_store_jobs(output).values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [11, 21]
+    assert src.group_sizes == [1, 0, 1]
+    assert [state.group_states[g].next_stored_block_idx for g in (0, 2)] == [1, 1]
+
+
+def test_external_junction_is_recorded_when_sparse_group_misses():
+    """A longer full-attention hit than the Mamba group's in the external
+    tier is a shared-prefix junction; record it on the request so the state
+    gets materialized, kept and stored (Codex P1 on 3ebe71d389)."""
+    scheduler, req, _ = _make_scratch_scheduler()
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(12)]
+    req.num_prompt_tokens = req.num_tokens = 48
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    full_keys = set(state.group_states[0].offload_keys[:2])
+    # Full attention: first two blocks stored; Mamba: nothing stored.
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in full_keys
+
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+
+    assert num_hit == 0
+    assert state.external_full_attention_hit_tokens == 32
+    assert req.shared_prefix_boundary == 32
+
+    # A complete hit (Mamba state present at block 2) is not a junction.
+    req.shared_prefix_boundary = 0
+    mamba_key = state.group_states[2].offload_keys[1]
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        key in full_keys or key == mamba_key
+    )
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_hit == 32
+    assert req.shared_prefix_boundary == 0
+
+
+def test_external_junction_not_recorded_without_sparse_groups():
+    scheduler, req, _ = _make_scratch_scheduler(full_attention_only=True)
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(8)]
+    req.num_prompt_tokens = req.num_tokens = 32
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    first = set(state.group_states[0].offload_keys[:1])
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in first
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_hit == 0
+    assert req.shared_prefix_boundary == 0
