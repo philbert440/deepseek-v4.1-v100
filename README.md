@@ -21,7 +21,7 @@ MoE kernel, RAM-resident Engram, layer-sliced prefill, fused indexer kernels and
 | Upstream | 1Cat-vLLM `main` @ [`3d56d991002dc132565ac585c8dabb76c4ff877b`](https://github.com/1CatAI/1Cat-vLLM/commit/3d56d991002dc132565ac585c8dabb76c4ff877b) (2026-10-07, after the v1.5.1 release) |
 | Bring-up | [#1031](https://github.com/1CatAI/1Cat-vLLM/pull/1031) (PLI Labs) at [`a36df7c2239a13ae8da3f257151bdf92f335cc5f`](https://github.com/1CatAI/1Cat-vLLM/commit/a36df7c2239a13ae8da3f257151bdf92f335cc5f), five commits |
 | This engine | [#1243](https://github.com/1CatAI/1Cat-vLLM/pull/1243) plus the later work: engine commit `714597f12461127be033257760fa438d0ee5267f` (tag `ds41-final-20261025`), then a sliced-prefill fix (`a9c8c9d6f55b`) and image input (`71c3e6e14fef`) |
-| Snapshot tags | [`ds41-vision-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-vision-20261025) (current), [`ds41-final-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-final-20261025) (text-only) |
+| Snapshot tags | [`ds41-vision-20261025b`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-vision-20261025b) (current), [`ds41-vision-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-vision-20261025) (one image per prompt), [`ds41-final-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-final-20261025) (text-only) |
 
 The history starts with two commits. The first imports #1031's head tree (upstream `main` plus #1031) unmodified,
 without upstream history. The second is the engine, squashed. Its tree equals engine commit `714597f124` except for
@@ -54,11 +54,11 @@ reference code before it went live.
 ## Install (prebuilt wheel)
 
 ```bash
-# download 1cat_vllm-1.5.2.dev1148+ds41vision1025-cp312-cp312-linux_x86_64.whl and SHA256SUMS from
-# https://github.com/philbert440/deepseek-v4.1-v100/releases/tag/ds41-vision-20261025
+# download 1cat_vllm-1.5.2.dev1149+ds41vision1025b-cp312-cp312-linux_x86_64.whl and SHA256SUMS from
+# https://github.com/philbert440/deepseek-v4.1-v100/releases/tag/ds41-vision-20261025b
 sha256sum -c SHA256SUMS
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python ./1cat_vllm-1.5.2.dev1148+ds41vision1025-cp312-cp312-linux_x86_64.whl ninja --torch-backend=cu128
+uv pip install --python .venv/bin/python ./1cat_vllm-1.5.2.dev1149+ds41vision1025b-cp312-cp312-linux_x86_64.whl ninja --torch-backend=cu128
 ```
 
 The wheel is built from the tagged tree with `TORCH_CUDA_ARCH_LIST=7.0`, CUDA 12.8.1, gcc 14 and torch 2.10.0+cu128 on
@@ -107,7 +107,9 @@ Served model name: `deepseek-v4.1-flash`. Thinking is off by default. Pass
 ## Image input
 
 Send images as OpenAI `image_url` content parts (data URLs work). Images inside tool results work too. Each image
-becomes up to 1,024 prompt tokens: a 800×600 image is about 317. Nothing extra to configure.
+becomes up to 1,024 prompt tokens: a 800×600 image is about 317. Up to 64 images per prompt by default
+(`--limit-mm-per-prompt` overrides it), so agent sessions can keep their screenshots in the history. The first
+vision release, `ds41-vision-20261025`, kept 1Cat's SM70 default of one image per prompt.
 
 The vision tower and aligner weights (926 MiB as FP16) stay in pinned host memory. TP rank 0 of the first stage streams
 them through two small GPU buffers per image and broadcasts the image embeddings to its TP group. The KV pool, and so
@@ -116,7 +118,7 @@ route through the MoE gate's `bias_vl`, and Engram skips them, as in DeepSeek's 
 the reference tower, this tower's output has relative L2 error 1.5e-2, closer than the reference's own bf16 path (2.7e-2).
 
 Measured on the vision build: a text image read back exactly in 0.8 s (330-token prompt); a 2400×1600 image read in
-5.3 s (991-token prompt); a screenshot returned in a tool result read correctly in 1.2 s. Text quality and speed are
+5.3 s (991-token prompt); a screenshot returned in a tool result read correctly in 1.2 s; three images in one prompt answered correctly in 2.2 s. Text quality and speed are
 the same as the text-only build: KL 0.0358, self-consistency worst mean 0.0237, KV pool 1,055,580 tokens, decode within
 noise.
 
