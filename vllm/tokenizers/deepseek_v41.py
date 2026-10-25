@@ -56,7 +56,8 @@ def resolve_reasoning(kwargs: dict[str, Any]) -> tuple[str, int]:
 
 def normalize_messages(messages: list[ChatCompletionMessageParam],
                        tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """OpenAI messages -> the encoder's message dicts (text-only; list content joined by blank lines)."""
+    """OpenAI messages -> the encoder's message dicts (text list content joined by blank lines; lists with images
+    stay blocks for the encoder)."""
     result = [dict(message) for message in copy.deepcopy(messages)]
     for message in result:
         role = message.get("role")
@@ -68,13 +69,18 @@ def normalize_messages(messages: list[ChatCompletionMessageParam],
             message["reasoning_content"] = message["reasoning"]
         content = message.get("content")
         if isinstance(content, list):
-            parts = []
+            parts, has_image = [], False
             for block in content:
                 part_type = block.get("type")
-                if part_type not in ("text", "input_text", "output_text"):
-                    raise ValueError(f"the SM70 DeepSeek V4.1 port is text-only; got a {part_type!r} content part")
-                parts.append(block.get("text", ""))
-            message["content"] = "\n\n".join(parts)
+                if part_type in ("text", "input_text", "output_text"):
+                    parts.append({"type": "text", "text": block.get("text", "")})
+                elif part_type in ("image_url", "input_image", "image_pil", "image"):
+                    # the encoder writes one placeholder per image block, in prompt order (also inside tool results)
+                    parts.append({"type": "image_url", "image_url": block.get("image_url") or {"url": ""}})
+                    has_image = True
+                else:
+                    raise ValueError(f"DeepSeek V4.1 supports text and image content only; got {part_type!r}")
+            message["content"] = parts if has_image else "\n\n".join(p["text"] for p in parts)
     if tools:
         if result and result[0]["role"] == "system":
             result[0].setdefault("tools", tools)

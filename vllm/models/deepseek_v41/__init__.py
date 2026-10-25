@@ -7,6 +7,7 @@ Importing this package must stay cheap and side-effect free: every lane imports
 ``vllm.models.deepseek_v41.common.contracts``, which imports this ``__init__`` first.
 The model class is therefore resolved lazily (PEP 562 ``__getattr__``) and a missing
 implementation raises a clear error instead of failing at package import time.
+The model class takes image input (common/vision.py, common/mm_preprocess.py).
 """
 
 from __future__ import annotations

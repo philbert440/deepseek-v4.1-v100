@@ -297,6 +297,10 @@ class SpecDecodeBaseProposer:
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             vllm_config.model_config
         )
+        if "DeepseekV41ForCausalLM" in (vllm_config.model_config.architectures or []):
+            # DS4.1 DSpark: the drafter reads the target's hidden-state taps, which carry the image; it drafts from
+            # token ids (image positions keep the placeholder id), text-only
+            self.supports_mm_inputs = False
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
@@ -2213,9 +2217,9 @@ class SpecDecodeBaseProposer:
                     target_model.config.media_placeholder_token_id
                 )
             else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
-                )
+                self.model.config.image_token_index = getattr(
+                    target_model.config, "image_token_index",
+                    getattr(target_model.config, "image_token_id", None))
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()

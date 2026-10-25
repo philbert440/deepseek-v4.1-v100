@@ -28,6 +28,7 @@ import torch
 from torch import nn
 
 from vllm.models.deepseek_v41 import knobs
+from vllm.models.deepseek_v41.common import vl_mask
 from vllm.models.deepseek_v41.common.contracts import (
     ENGRAM_HEAD_DIM,
     ENGRAM_ROW_BYTES,
@@ -285,6 +286,8 @@ class EngramHasher:
             raise ValueError(f"token id outside [0, {self.token_map.shape[0]}): min {int(ids.min())} "
                              f"max {int(ids.max())}")
         out = self.token_map[ids]
+        if token_mask is None and (np.asarray(token_ids) == vl_mask.IMAGE_TOKEN_ID).any():
+            token_mask = np.asarray(token_ids) != vl_mask.IMAGE_TOKEN_ID
         if token_mask is not None:
             out = np.where(np.asarray(token_mask, dtype=bool), out, DEAD_ID)
         return out
@@ -546,6 +549,7 @@ class DeepseekV41Engram(nn.Module):
         if stream.dtype != STREAM_DTYPE or tuple(stream.shape[1:]) != (HC, HIDDEN):
             raise ValueError(f"{self.prefix}: stream {tuple(stream.shape)} {stream.dtype}, expected [T, {HC}, "
                              f"{HIDDEN}] {STREAM_DTYPE}")
+        vl = vl_mask.rows(t_pad)        # image-span rows: no Engram contribution (ref:model.py Engram token_mask)
         rows = self.service.rows_buffer(self.layer_id, t_pad)
         _eager_wait()(self.service, self.layer_id, rows)
         row_bias = self.service.row_bias(self.layer_id)
@@ -566,8 +570,11 @@ class DeepseekV41Engram(nn.Module):
                 from vllm.distributed import tensor_model_parallel_all_reduce
 
                 part = tensor_model_parallel_all_reduce(part)
+            keep = None if vl is None else stream[a:b].clone()
             if self.impl == "sm70":
                 ek.post_wkv_gate_(stream[a:b], part, self.qk, 1.0)
             else:
                 post_wkv_gate_torch_(stream[a:b], part, self.qk, 1.0)
+            if keep is not None:
+                stream[a:b] = torch.where(vl[a:b].view(-1, 1, 1), keep, stream[a:b])
         return stream

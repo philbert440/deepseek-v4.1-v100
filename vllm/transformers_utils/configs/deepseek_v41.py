@@ -3,10 +3,9 @@
 """DeepSeek-V4.1 config (port of upstream vLLM b6d8e8af ``transformers_utils/configs/deepseek_v41.py``).
 
 The official config.json nests the text model under ``text_config`` (model_type ``deepseek_v41_text``) and
-the vision tower under ``vision_config``. The 1Cat SM70 port is text-only: the text fields are flattened onto
-the top level (the model code reads flat attributes, as for V4), the vision fields are kept only as
-``vision_*`` metadata and every vision/aligner tensor is load-skipped by
-``DeepseekV41ForCausalLM.skip_checkpoint_weight`` (PORT_DESIGN §3.7).
+the vision tower under ``vision_config``. The 1Cat SM70 port flattens the text fields onto the top level (the
+model code reads flat attributes, as for V4) and keeps the vision fields as ``vision_*`` attributes for the
+host-resident tower (``models/deepseek_v41/common/vision.py``).
 
 Importing this module also registers the ``deepseek_v41_fp8`` quantization method (see
 ``_register_v41_quant_method``): it is the first DeepSeek-V4.1 code every process (engine, API server,

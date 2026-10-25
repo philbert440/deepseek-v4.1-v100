@@ -37,6 +37,7 @@ from vllm.forward_context import get_forward_context as _forward_context   # for
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index, make_layers, maybe_prefix
 from vllm.sequence import IntermediateTensors
@@ -66,9 +67,17 @@ LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too:
 MIRROR_CHECK_KNOB = "VLLM_DS41_ATTN_MIRROR_CHECK"
 KV20_CRC_KEY = "kv20_crc"
 
+from vllm.models.deepseek_v41.common import vl_mask
+from vllm.models.deepseek_v41.common.mm_preprocess import (IMAGE_PLACEHOLDER, DeepseekV4VLDummyInputsBuilder,
+                                                           DeepseekV4VLMultiModalProcessor,
+                                                           DeepseekV4VLProcessingInfo)
+from vllm.models.deepseek_v41.common.vision import DeepseekV41VisionTower
+from vllm.multimodal import MULTIMODAL_REGISTRY
+
 logger = init_logger(__name__)
 _LAYER_RE = re.compile(r"^layers\.(\d+)\.")
-_SKIP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
+_SKIP_PREFIXES = ("mtp.",)
+_VISION_PREFIXES = ("vision.", "aligner.", "image_")   # host-resident tower (common/vision.py), TP rank 0 of stage 0
 
 
 @dataclass
@@ -197,7 +206,8 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.engram = DeepseekV41Engram(vllm_config, f"{prefix}.engram", topo.layer_id, engram_service)
         self.attn = DeepseekV41Attention(vllm_config, f"{prefix}.attn", topo, stage, shared, aux_streams=None)
         self.ffn = DeepseekV41MoE(vllm_config, f"{prefix}.ffn", topo.layer_id, n_routed_experts=C.N_EXPERTS,
-                                  top_k=C.TOP_K, spill=spill)
+                                  top_k=C.TOP_K, spill=spill,
+                                  vl_bias=int(getattr(vllm_config.model_config.hf_config, "vision_n_layers", 0) or 0) > 0)
         self.attn_norm = DeepseekV41Norm(C.HIDDEN)
         self.ffn_norm = DeepseekV41Norm(C.HIDDEN)
         mix, hc_dim = (2 + C.HC) * C.HC, C.HC * C.HIDDEN
@@ -491,7 +501,7 @@ class DeepseekV41Model(nn.Module):
                   dbg: _LayerDebug | None = None) -> bool:
         """VLLM_DS41_SP_HC applies to this forward: stage 0, prefill-sized, eager, plain (no replay plan, DSpark taps
         or debug), TP > 1."""
-        if not self.__dict__.get("_sp_hc", False) or not self.pp_is_first or T < sp_hc.SP_MIN_T:
+        if not self.__dict__.get("_sp_hc", False) or not self.pp_is_first or T < sp_hc.SP_MIN_T or vl_mask.active():
             return False
         if plan is not None or aux_layers or dbg is not None or ds41_dump.ENABLED:
             return False
@@ -545,6 +555,7 @@ class DeepseekV41Model(nn.Module):
                     replay.zero_dropped(md_full, rows.dropped)
                     kept = rows.kept
                     stream, pre, positions = stream.index_select(0, kept), pre.index_select(0, kept), rows.positions
+                    vl_mask.compact(kept)
                     fwd_ctx.attn_metadata = md_kept
                 stream, pre = layer(stream, pre, positions)
                 if dbg is not None and dbg.row >= 0:
@@ -580,6 +591,15 @@ class DeepseekV41Model(nn.Module):
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None,
                 inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
+        vl_mask.begin(input_ids)
+        try:
+            return DeepseekV41Model._forward(self, input_ids, positions, intermediate_tensors, inputs_embeds)
+        finally:
+            vl_mask.end()
+
+    def _forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
+                 intermediate_tensors: IntermediateTensors | None,
+                 inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
         if ds41_dump.ENABLED:
             ds41_dump.begin_step(positions, positions.shape[0])
         stream, pre = self._embed_or_ingest(input_ids, positions, intermediate_tensors, inputs_embeds)
@@ -809,7 +829,20 @@ def map_checkpoint_name(name: str) -> str:
     return mapped
 
 
-class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
+@MULTIMODAL_REGISTRY.register_processor(DeepseekV4VLMultiModalProcessor, info=DeepseekV4VLProcessingInfo,
+                                        dummy_inputs=DeepseekV4VLDummyInputsBuilder)
+class DeepseekV41ForCausalLM(nn.Module, SupportsPP, SupportsMultiModal):
+    # vision (common/vision.py, common/vl_mask.py): the router needs the raw ids next to inputs_embeds; text-only
+    # steps keep token-id inputs (CUDA-graph decode unchanged), only steps with image tokens use inputs_embeds
+    requires_raw_input_tokens = True
+    ds41_text_steps_use_ids = True
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return IMAGE_PLACEHOLDER
+        raise ValueError(f"Unsupported modality: {modality!r}")
+
     supports_eagle3 = True   # aux hidden states for the DSpark drafter (vllm SupportsEagle3 protocol)
     has_own_lm_head = False  # SupportsEagleBase members (the runtime-checkable protocol needs every attribute)
     has_own_embed_tokens = False
@@ -843,6 +876,12 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         self.pp_static_schema = self.model.pp_static_schema
         self.pp_send_schema = self.model.pp_send_schema
         self._delegates: dict[str, nn.Module] = {}
+        mm = vllm_config.model_config.multimodal_config
+        limit = mm.get_limit_per_prompt("image") if mm is not None else 0
+        self.vision_enabled = int(getattr(config, "vision_n_layers", 0) or 0) > 0 and limit > 0
+        self._vision: DeepseekV41VisionTower | None = None
+        if self.vision_enabled and self.model.pp_is_first and get_tensor_model_parallel_rank() == 0:
+            self._vision = DeepseekV41VisionTower(config)
 
     @property
     def engram_service(self) -> EngramHostService | None:
@@ -854,8 +893,50 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         The runner binds each real step's per-request token counts to it right before the forward."""
         return self.model.replay
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    def get_language_model(self) -> nn.Module:
+        # the vision tower lives beside the LM in this class: callers (drafter embedding / head sharing, loaders)
+        # get the same module the text-only model gave them
+        return self
+
+    def embed_multimodal(self, **kwargs: object) -> tuple[torch.Tensor, ...]:
+        """Per image: its whole span [n_llm_h * (n_llm_w + 1) + 2, 5120] in the embedding dtype. TP rank 0 encodes
+        (host-streamed tower), the span rows are broadcast over the TP group."""
+        patches = kwargs.get("patches")
+        if patches is None:
+            return ()
+        vit_grid = [tuple(int(v) for v in g) for g in kwargs["vit_grid"].tolist()]
+        llm_grid = [tuple(int(v) for v in g) for g in kwargs["llm_grid"].tolist()]
+        types = kwargs["types"]
+        if isinstance(patches, (list, tuple)):
+            patches = torch.cat(list(patches))
+        if isinstance(types, (list, tuple)):
+            types = torch.cat(list(types))
+        spans = [h * (w + 1) + 2 for h, w in llm_grid]
+        dtype = self.model.embed_tokens.weight.dtype
+        flat = torch.empty((sum(spans), self.config.hidden_size), dtype=dtype, device=patches.device)
+        if self._vision is not None:
+            p0 = s0 = 0
+            for (nh, nw), n_span in zip(vit_grid, spans):
+                span = self._vision.span(patches[p0: p0 + nh * nw], nh, nw, types[s0: s0 + n_span])
+                if dtype == torch.float16 and not bool(torch.isfinite(span.half()).all()):
+                    raise RuntimeError("DS41 vision: image embeddings overflow FP16")
+                flat[s0: s0 + n_span] = span.to(dtype)
+                p0, s0 = p0 + nh * nw, s0 + n_span
+        if get_tensor_model_parallel_world_size() > 1:
+            from vllm.distributed import get_tp_group
+
+            flat = get_tp_group().broadcast(flat, src=0)
+        return tuple(flat.split(spans))
+
+    def embed_input_ids(self, input_ids: torch.Tensor, multimodal_embeddings=None, *,
+                        is_multimodal: torch.Tensor | None = None) -> torch.Tensor:
+        embeds = self.model.embed_input_ids(input_ids)
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return embeds
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        return _merge_multimodal_embeddings(inputs_embeds=embeds, multimodal_embeddings=multimodal_embeddings,
+                                            is_multimodal=is_multimodal)
 
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None = None,
@@ -879,8 +960,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
 
     # ---- loading ----
     def skip_checkpoint_weight(self, name: str) -> bool:
-        if name.startswith(_SKIP_PREFIXES) or ".engram.embed." in name or name.endswith(".bias_vl"):
+        if name.startswith(_SKIP_PREFIXES) or ".engram.embed." in name:
             return True
+        if name.startswith(_VISION_PREFIXES):
+            return self._vision is None
         if self._exl3_experts:
             # hybrid checkpoint (moe_exl3.py): routed experts from the EXL3 shards, everything else official. vLLM
             # yields every tensor of every listed shard, so drop the official MXFP4 experts and the EXL3 shards'
@@ -942,6 +1025,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 if ckpt_name in seen_dense:
                     continue
                 seen_dense.add(ckpt_name)
+            if ckpt_name.startswith(_VISION_PREFIXES):
+                self._vision.load(ckpt_name, tensor)
+                continue
             name = map_checkpoint_name(ckpt_name)
             delegate = self._delegate_for(name)
             if delegate is not None:
@@ -990,6 +1076,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                                    f"unconsumed {sorted(given - consumed)}, unknown {sorted(consumed - given)}")
             loaded.update(f"{prefix}.{name}" for name, _ in module.named_parameters())
         self._check_complete(loaded, {name: expected[name] - got for name, got in parts.items()})
+        if self._vision is not None:
+            self._vision.finalize()
+            logger.info("DS41 vision: tower on host (%.0f MiB pinned FP16, streamed per encode) on TP rank 0 of stage 0",
+                        self._vision.host_bytes() / 2**20)
         return loaded
 
     @staticmethod

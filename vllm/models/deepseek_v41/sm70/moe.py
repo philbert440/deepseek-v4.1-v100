@@ -8,7 +8,7 @@
 * router: logits in FP32 from an exponent-biased FP16 copy of the BF16 gate weight (``W * 2^e`` is exact in FP16
   for the real checkpoint; FP16 x FP16 products are exact in FP32, so the logits equal the reference's FP32
   GEMV up to summation order); ``sqrt(softplus)``, top-k of ``score + bias`` (bias selects only), weights =
-  ``score / (sum + 1e-20) * 1.5``; no hash layers, ``bias_vl`` not loaded (text only);
+  ``score / (sum + 1e-20) * 1.5``; no hash layers; image-span rows (common/vl_mask.py) select with ``bias_vl``;
 * routed experts: ``DeepseekV41Mxfp4MoEMethod.expert_slots`` (per-route FP16 outputs, TP-partial);
 * shared expert: FP16 weights (dense FP8 dequantised by the quant config's fallback); W13 output and the SwiGLU
   rounded to FP16 like a routed expert, W2 output kept FP32;
@@ -117,10 +117,13 @@ def make_v41_moe_method(moe: FusedMoEConfig) -> FusedMoEMethodBase:
 class DeepseekV41Gate(nn.Module):
     """Router weight [E, 5120] stored as FP16 ``W * 2^weight_exp`` (exact; chosen at load) + FP32 bias."""
 
-    def __init__(self, n_experts: int, hidden: int) -> None:
+    def __init__(self, n_experts: int, hidden: int, vl_bias: bool = False) -> None:
         super().__init__()
         self.weight = Parameter(torch.zeros(n_experts, hidden, dtype=torch.float16), requires_grad=False)
         self.e_score_correction_bias = Parameter(torch.zeros(n_experts, dtype=torch.float32), requires_grad=False)
+        # vision checkpoints: the selection bias of image-span tokens (ref:model.py Gate.bias_vl, noaux_tc_for_vl)
+        self.bias_vl = (Parameter(torch.zeros(n_experts, dtype=torch.float32), requires_grad=False)
+                        if vl_bias else None)
         self.weight_exp = 0
         set_weight_attrs(self.weight, {"weight_loader": self._load_weight})
 
@@ -164,7 +167,8 @@ class DeepseekV41SharedExpert(nn.Module):
 
 class DeepseekV41MoE(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str, layer_id: int, *, n_routed_experts: int = 384,
-                 top_k: int = 6, spill: ExpertSpillPlan | None = None, exl3: bool = True) -> None:
+                 top_k: int = 6, spill: ExpertSpillPlan | None = None, exl3: bool = True,
+                 vl_bias: bool = False) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.layer_id = layer_id
@@ -198,7 +202,7 @@ class DeepseekV41MoE(nn.Module):
                                 if hist_dir and get_tensor_model_parallel_rank() == 0 else None)
         self.route_hist = np.zeros((2, self.n_experts), dtype=np.int64)
         quant_config = vllm_config.quant_config
-        self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
+        self.gate = DeepseekV41Gate(self.n_experts, self.hidden, vl_bias)
         with expert_spill_context(spill), expert_layer_context(layer_id), exl3_context(exl3):
             self.experts = FusedMoE(
                 num_experts=self.n_experts, top_k=self.top_k, hidden_size=self.hidden,
@@ -233,8 +237,17 @@ class DeepseekV41MoE(nn.Module):
         return fixed_m.mm(x, self.gate.weight.t(), out_dtype=torch.float32).mul_(alpha)
 
     def route(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """FP32 logits [T, E] -> (weights [T, k] f32, ids [T, k] int32)."""
-        bias = self.gate.e_score_correction_bias
+        """FP32 logits [T, E] -> (weights [T, k] f32, ids [T, k] int32). Image-span rows of this forward select
+        their experts with ``bias_vl`` (routed twice, picked per row: exact, and only on steps with an image)."""
+        vl = vl_mask.rows(logits.shape[0]) if self.gate.bias_vl is not None else None
+        w, ids = self._route(logits, self.gate.e_score_correction_bias)
+        if vl is None:
+            return w, ids
+        w_vl, ids_vl = self._route(logits, self.gate.bias_vl)
+        pick = vl.unsqueeze(1)
+        return torch.where(pick, w_vl, w).contiguous(), torch.where(pick, ids_vl, ids).contiguous()
+
+    def _route(self, logits: torch.Tensor, bias: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.impl == "torch":
             scores = F.softplus(logits).sqrt()
             ids = (scores + bias).topk(self.top_k, dim=-1)[1]
@@ -321,6 +334,8 @@ class DeepseekV41MoE(nn.Module):
             raise RuntimeError(f"DeepseekV41MoE layer {self.layer_id}: router ids differ across TP ranks "
                                f"(checksums {gathered.tolist()}); TP-replicated inputs must be bitwise equal (§4.1)")
 
+
+from vllm.models.deepseek_v41.common import vl_mask
 
 logger = init_logger(__name__)
 MOE_RANK_TIMING_ENV = "VLLM_DS41_MOE_RANK_TIMING"

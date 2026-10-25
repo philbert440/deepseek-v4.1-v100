@@ -6623,6 +6623,24 @@ class GPUModelRunner(
         self._engram_bind_service_cache = service
         return service
 
+    def _ds41_text_steps_use_ids(self) -> bool:
+        """DeepSeek-V4.1 vision: text-only steps keep token-id inputs (and their CUDA graphs)."""
+        model = self.get_model() if hasattr(self, "model") else None
+        return bool(getattr(model, "ds41_text_steps_use_ids", False))
+
+    def _ds41_step_has_image(self, scheduler_output: "SchedulerOutput") -> bool:
+        """A scheduled token of this step lies inside an image placeholder span (host data)."""
+        for req_id, n in scheduler_output.num_scheduled_tokens.items():
+            req_state = self.requests.get(req_id)
+            if req_state is None or not req_state.mm_features:
+                continue
+            start = req_state.num_computed_tokens
+            for feature in req_state.mm_features:
+                pos = feature.mm_position
+                if pos.offset < start + n and start < pos.offset + pos.length:
+                    return True
+        return False
+
     def _ds41_replay_controller(self) -> Any | None:
         """DeepSeek-V4.1 decoder-replay controller of this stage's model, or None; resolved once."""
         cached = getattr(self, "_ds41_replay_cache", False)
@@ -6953,7 +6971,8 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        if (self.supports_mm_inputs and is_first_rank and not is_encoder_decoder
+                and (not self._ds41_text_steps_use_ids() or getattr(self, "_ds41_vl_step", False))):
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -8856,6 +8875,13 @@ class GPUModelRunner(
                     self.query_start_loc.np[: num_reqs + 1],
                     self._ds41_replay_target_lens(num_reqs),
                 )
+            if self.supports_mm_inputs and self._ds41_text_steps_use_ids():
+                # DeepSeek-V4.1 vision: only steps that schedule image tokens take inputs_embeds
+                # and arm the image-span mask (host data only)
+                from vllm.models.deepseek_v41.common import vl_mask
+
+                self._ds41_vl_step = self._ds41_step_has_image(scheduler_output)
+                vl_mask.arm(self._ds41_vl_step)
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -11488,7 +11514,8 @@ class GPUModelRunner(
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            if (self.supports_mm_inputs and not self.model_config.is_encoder_decoder
+                    and not self._ds41_text_steps_use_ids()):
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
                 model_kwargs = {
@@ -11921,7 +11948,11 @@ class GPUModelRunner(
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
-            if mm_config is not None and mm_config.skip_mm_profiling:
+            if self._ds41_text_steps_use_ids():
+                # DS4.1: the 1M-context KV pool has no slack for profiled encoder outputs. The host-streamed tower's
+                # transient (~200 MiB on TP rank 0 of stage 0) is freed before the LM forward of the same step.
+                logger.info("DS41 vision: skipping encoder memory profiling (host-streamed tower)")
+            elif mm_config is not None and mm_config.skip_mm_profiling:
                 logger.info(
                     "Skipping memory profiling for multimodal encoder and "
                     "encoder cache."
