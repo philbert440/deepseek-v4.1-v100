@@ -7,7 +7,8 @@ at its native 1,048,576-token context on 8× V100-SXM2-32GB, plus a prebuilt SM7
 The tree is the engine that is live and benchmarked as of 2026-10-25. It contains everything in
 [1CatAI/1Cat-vLLM#1243](https://github.com/1CatAI/1Cat-vLLM/pull/1243) (the engine as of 2026-10-21) and the prefill
 and decode work since then, which #1243 doesn't have: decoder replay, fused prefill attention, the tiled EXL3 prefill
-MoE kernel, RAM-resident Engram, layer-sliced prefill, fused indexer kernels and the DSpark tap fix.
+MoE kernel, RAM-resident Engram, layer-sliced prefill, fused indexer kernels and the DSpark tap fix. Since tag
+`ds41-vision-20261025` it also takes image input: the vision tower and aligner, which the port used to skip.
 
 - Model page: https://philtompkins.com/models/deepseek-v4.1-flash
 - Checkpoint: https://huggingface.co/philbert440/DeepSeek-V4.1-Flash-1017-EXL3-franken-v100
@@ -19,10 +20,10 @@ MoE kernel, RAM-resident Engram, layer-sliced prefill, fused indexer kernels and
 |---|---|
 | Upstream | 1Cat-vLLM `main` @ [`3d56d991002dc132565ac585c8dabb76c4ff877b`](https://github.com/1CatAI/1Cat-vLLM/commit/3d56d991002dc132565ac585c8dabb76c4ff877b) (2026-10-07, after the v1.5.1 release) |
 | Bring-up | [#1031](https://github.com/1CatAI/1Cat-vLLM/pull/1031) (PLI Labs) at [`a36df7c2239a13ae8da3f257151bdf92f335cc5f`](https://github.com/1CatAI/1Cat-vLLM/commit/a36df7c2239a13ae8da3f257151bdf92f335cc5f), five commits |
-| This engine | [#1243](https://github.com/1CatAI/1Cat-vLLM/pull/1243) plus the later work: engine commit `714597f12461127be033257760fa438d0ee5267f` |
-| Snapshot tag | [`ds41-final-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-final-20261025) |
+| This engine | [#1243](https://github.com/1CatAI/1Cat-vLLM/pull/1243) plus the later work: engine commit `714597f12461127be033257760fa438d0ee5267f` (tag `ds41-final-20261025`), then a sliced-prefill fix (`a9c8c9d6f55b`) and image input (`71c3e6e14fef`) |
+| Snapshot tags | [`ds41-vision-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-vision-20261025) (current), [`ds41-final-20261025`](https://github.com/philbert440/deepseek-v4.1-v100/tree/ds41-final-20261025) (text-only) |
 
-The history here has two commits. The first imports #1031's head tree (upstream `main` plus #1031) unmodified,
+The history starts with two commits. The first imports #1031's head tree (upstream `main` plus #1031) unmodified,
 without upstream history. The second is the engine, squashed. Its tree equals engine commit `714597f124` except for
 publication edits:
 
@@ -34,7 +35,9 @@ publication edits:
   source checkout;
 - internal benchmark-gate drivers, which were removed.
 
-No kernel or model logic differs. The commit after the tag adds this README and `v100/`.
+No kernel or model logic differs. The commit after that tag adds this README and `v100/`. The two engine commits
+after it (the sliced-prefill fix and image input) are replayed as they are, and their trees match the served engine
+the same way.
 
 Every addition sits behind its own `VLLM_DS41_*` knob, and each one was gated against an fp32 CPU run of DeepSeek's
 reference code before it went live.
@@ -51,11 +54,11 @@ reference code before it went live.
 ## Install (prebuilt wheel)
 
 ```bash
-# download 1cat_vllm-1.5.2.dev1146+ds41final1025-cp312-cp312-linux_x86_64.whl and SHA256SUMS from
-# https://github.com/philbert440/deepseek-v4.1-v100/releases/tag/ds41-final-20261025
+# download 1cat_vllm-1.5.2.dev1148+ds41vision1025-cp312-cp312-linux_x86_64.whl and SHA256SUMS from
+# https://github.com/philbert440/deepseek-v4.1-v100/releases/tag/ds41-vision-20261025
 sha256sum -c SHA256SUMS
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python ./1cat_vllm-1.5.2.dev1146+ds41final1025-cp312-cp312-linux_x86_64.whl ninja --torch-backend=cu128
+uv pip install --python .venv/bin/python ./1cat_vllm-1.5.2.dev1148+ds41vision1025-cp312-cp312-linux_x86_64.whl ninja --torch-backend=cu128
 ```
 
 The wheel is built from the tagged tree with `TORCH_CUDA_ARCH_LIST=7.0`, CUDA 12.8.1, gcc 14 and torch 2.10.0+cu128 on
@@ -100,6 +103,22 @@ RAM, a boot takes about 12 minutes.
 
 Served model name: `deepseek-v4.1-flash`. Thinking is off by default. Pass
 `chat_template_kwargs: {"thinking": true}` and it arrives in the `reasoning` field.
+
+## Image input
+
+Send images as OpenAI `image_url` content parts (data URLs work). Images inside tool results work too. Each image
+becomes up to 1,024 prompt tokens: a 800×600 image is about 317. Nothing extra to configure.
+
+The vision tower and aligner weights (926 MiB as FP16) stay in pinned host memory. TP rank 0 of the first stage streams
+them through two small GPU buffers per image and broadcasts the image embeddings to its TP group. The KV pool, and so
+the 1M context, are unchanged. Steps without image tokens run exactly as before, CUDA-graph decode included. Image tokens
+route through the MoE gate's `bias_vl`, and Engram skips them, as in DeepSeek's reference code. Against an fp32 run of
+the reference tower, this tower's output has relative L2 error 1.5e-2, closer than the reference's own bf16 path (2.7e-2).
+
+Measured on the vision build: a text image read back exactly in 0.8 s (330-token prompt); a 2400×1600 image read in
+5.3 s (991-token prompt); a screenshot returned in a tool result read correctly in 1.2 s. Text quality and speed are
+the same as the text-only build: KL 0.0358, self-consistency worst mean 0.0237, KV pool 1,055,580 tokens, decode within
+noise.
 
 ## Measured (this engine, 2026-10-25)
 
