@@ -534,7 +534,7 @@ nvidia-nvshmem-cu12==3.4.5
     # via torch
 nvidia-nvtx-cu12==12.8.90
     # via torch
-open-clip-torch==2.32.0
+open-clip-torch==3.3.0
     # via -r requirements/test/cuda.in
 openai-harmony==0.0.4
     # via
